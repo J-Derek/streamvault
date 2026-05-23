@@ -1,0 +1,95 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 5.1%;
+    --foreground: 0 0% 100%;
+
+    --card: 0 0% 11%;
+    --card-foreground: 0 0% 100%;
+
+    --popover: 0 0% 11%;
+    --popover-foreground: 0 0% 100%;
+
+    --primary: 357 91% 47%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 0 0% 18%;
+    --secondary-foreground: 0 0% 100%;
+
+    --muted: 0 0% 18%;
+    --muted-foreground: 240 2% 68%;
+
+    --accent: 0 0% 18%;
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 0 0% 24%;
+    --input: 0 0% 24%;
+    --ring: 357 91% 47%;
+
+    --radius: 0.5rem;
+
+    /* StreamVault tokens */
+    --sv-bg-primary: 0 0% 5.1%;
+    --sv-bg-surface: 240 3% 11.4%;
+    --sv-bg-elevated: 240 3% 17.6%;
+    --sv-accent-red: 357 91% 47%;
+    --sv-accent-red-dk: 357 91% 37%;
+    --sv-text-primary: 0 0% 100%;
+    --sv-text-secondary: 240 2% 68%;
+    --sv-text-tertiary: 240 2% 39%;
+    --sv-gold: 45 93% 53%;
+    --sv-teal: 195 100% 42%;
+    --sv-green: 142 69% 49%;
+    --sv-orange: 36 100% 52%;
+    --sv-purple: 279 86% 65%;
+    --sv-border: 0 0% 24%;
+
+    --sidebar-background: 0 0% 5.1%;
+    --sidebar-foreground: 0 0% 100%;
+    --sidebar-primary: 357 91% 47%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 0 0% 18%;
+    --sidebar-accent-foreground: 0 0% 100%;
+    --sidebar-border: 0 0% 24%;
+    --sidebar-ring: 357 91% 47%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+
+  h1, h2, h3, h4 {
+    font-family: 'Inter', system-ui, sans-serif;
+    font-weight: 900;
+    line-height: 1.2;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+}

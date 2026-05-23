@@ -1,0 +1,18 @@
+[[permission]]
+identifier = "player-commands"
+description = "Allows custom player commands"
+commands.allow = [
+    "download_media",
+    "download_torrent",
+    "open_in_external_player",
+    "start_p2p_download",
+    "stop_p2p_download",
+    "get_p2p_status",
+    "get_p2p_global_stats",
+    "spawn_p2p_engine",
+    "kill_p2p_engine",
+    "finalize_p2p_download",
+    "delete_media_file",
+    "resolve_p2p_file",
+    "resolve_p2p_file_by_hash"
+]
