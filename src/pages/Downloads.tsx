@@ -1,7 +1,7 @@
 import { useState, useMemo, useEffect } from "react";
 import Navbar from "@/components/Navbar";
 import { useDownloadStore, type DownloadTask } from "@/store/downloads";
-import { getOfflineStreamUrl } from "@/lib/downloads/manager";
+import { getOfflineStreamUrl, scanAndSyncLibrary } from "@/lib/downloads/manager";
 import MovieCard from "@/components/MovieCard";
 import {
     Download, HardDrive, Trash2, ChevronLeft, ChevronDown, ChevronRight,
@@ -208,6 +208,12 @@ const OfflineCard = ({
                         </AlertDialogDescription>
                     </AlertDialogHeader>
                     <AlertDialogFooter>
+                        <AlertDialogCancel
+                            className="bg-transparent border-[#3A3A3C] text-white hover:bg-white/5 hover:text-white"
+                            onClick={(e) => e.stopPropagation()}
+                        >
+                            Keep
+                        </AlertDialogCancel>
                         <AlertDialogAction
                             className="bg-[#E50914] hover:bg-[#B00610] text-white"
                             onClick={(e) => {
@@ -216,14 +222,8 @@ const OfflineCard = ({
                                 setIsDeleteDialogOpen(false);
                             }}
                         >
-                            Cancel Delete
+                            Delete
                         </AlertDialogAction>
-                        <AlertDialogCancel
-                            className="bg-transparent border-[#3A3A3C] text-white hover:bg-white/5 hover:text-white"
-                            onClick={(e) => e.stopPropagation()}
-                        >
-                            Keep
-                        </AlertDialogCancel>
                     </AlertDialogFooter>
                 </AlertDialogContent>
             </AlertDialog>
@@ -368,13 +368,21 @@ const DownloadsPage = () => {
         useDownloadStore();
     const [selectedTaskKey, setSelectedTaskKey] = useState<string | null>(null);
     const [engineStarting, setEngineStarting] = useState(false);
+    const [scanning, setScanning] = useState(false);
 
-    // Auto-start engine on mount if it's not running
-    useEffect(() => {
-        if (!p2pEngineReady && !engineStarting && isTauri) {
-            handleStartEngine();
+    const handleScan = async () => {
+        setScanning(true);
+        try {
+            await scanAndSyncLibrary();
+            toast({ title: "Library scan complete", description: "Your offline library is up to date." });
+        } catch (err) {
+            toast({ title: "Scan failed", description: String(err), variant: "destructive" });
+        } finally {
+            setScanning(false);
         }
-    }, []);
+    };
+
+    // Removed auto-start engine on mount to prevent unnecessary background processes.
 
     const handleStartEngine = async () => {
         if (!isTauri) return;
@@ -393,6 +401,24 @@ const DownloadsPage = () => {
             });
         } finally {
             setEngineStarting(false);
+        }
+    };
+
+    const handleStopEngine = async () => {
+        if (!isTauri) return;
+        try {
+            const { invoke } = await import("@tauri-apps/api/core");
+            await invoke("kill_p2p_engine");
+            useDownloadStore.getState().setP2pReady(false);
+            useDownloadStore.getState().clearTasks();
+            toast({ title: "Engine stopped", description: "P2P engine is now offline. All active torrents cleared." });
+        } catch (e) {
+            console.error("Failed to stop engine:", e);
+            toast({
+                title: "Failed to stop engine",
+                description: String(e),
+                variant: "destructive",
+            });
         }
     };
 
@@ -456,11 +482,21 @@ const DownloadsPage = () => {
                         )}
 
                         {p2pEngineReady && isTauri && (
-                            <div className="flex items-center gap-2 bg-[#1C1C1E] border border-[#3A3A3C] px-4 py-2 rounded-xl">
-                                <Activity className="w-4 h-4 text-[#34C759]" />
-                                <span className="text-xs font-bold text-[#34C759] uppercase tracking-widest">
-                                    {Math.floor((globalStats?.uptime_seconds ?? 0) / 60)}m uptime
-                                </span>
+                            <div className="flex items-center gap-2">
+                                <Button
+                                    onClick={handleStopEngine}
+                                    size="sm"
+                                    className="h-8 px-3 gap-1.5 bg-[#E50914]/10 hover:bg-[#E50914]/20 text-[#E50914] border border-[#E50914]/20 rounded-full text-[10px] font-black uppercase tracking-widest"
+                                >
+                                    <Power className="w-3 h-3" />
+                                    Stop Engine
+                                </Button>
+                                <div className="flex items-center gap-2 bg-[#1C1C1E] border border-[#3A3A3C] px-4 py-2 rounded-xl">
+                                    <Activity className="w-4 h-4 text-[#34C759]" />
+                                    <span className="text-xs font-bold text-[#34C759] uppercase tracking-widest">
+                                        {Math.floor((globalStats?.uptime_seconds ?? 0) / 60)}m uptime
+                                    </span>
+                                </div>
                             </div>
                         )}
                     </div>
@@ -512,9 +548,21 @@ const DownloadsPage = () => {
                 {/* ── Offline Library ── */}
                 {(offlineIds.length > 0 || episodeKeys.length > 0) && (
                     <section>
-                        <h2 className="text-sm font-black uppercase tracking-widest text-[#AEAEB2] mb-5">
-                            Offline Library · {offlineIds.length + episodeKeys.length}
-                        </h2>
+                        <div className="flex items-center justify-between mb-5">
+                            <h2 className="text-sm font-black uppercase tracking-widest text-[#AEAEB2]">
+                                Offline Library · {offlineIds.length + episodeKeys.length}
+                            </h2>
+                            <Button 
+                                onClick={handleScan} 
+                                disabled={scanning}
+                                size="sm"
+                                variant="outline"
+                                className="h-8 text-[10px] uppercase font-bold tracking-widest bg-transparent border-[#3A3A3C] text-[#AEAEB2] hover:text-white hover:bg-white/5"
+                            >
+                                {scanning ? <Loader2 className="w-3 h-3 mr-1.5 animate-spin" /> : null}
+                                {scanning ? "Scanning..." : "Scan Library"}
+                            </Button>
+                        </div>
 
                         {/* Movies (individual cards) */}
                         {offlineIds.length > 0 && (

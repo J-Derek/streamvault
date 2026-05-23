@@ -112,7 +112,7 @@ const PlayerPage = () => {
         const episode = parseInt(queryParams.get("e") || "1", 10);
         const infoHash = queryParams.get("infoHash");
         const fileIdx = queryParams.get("fileIdx") || "0";
-        const mirror = queryParams.get("mirror") || (isTauri ? "native" : "webtor");
+        const mirror = queryParams.get("mirror") || "webtor";
 
         let url = "";
         const fmt = (selectedProvider as any).urlFormat || "vidsrc-v2";
@@ -125,7 +125,7 @@ const PlayerPage = () => {
             } else {
                 isOfflineFallback = false;
                 if (mirror === "webtor") {
-                    url = `https://webtor.io/show?magnet=magnet%3A%3Fxt%3Durn%3Abtih%3A${infoHash}`;
+                    url = `https://webtor.io/embed#/magnet:?xt=urn:btih:${infoHash}&file-index=0`;
                 } else if (mirror === "instant") {
                     url = `https://instant.io/#${infoHash}`;
                 } else if (mirror === "magnet-player") {
@@ -160,69 +160,13 @@ const PlayerPage = () => {
         };
     }, [data, mediaType, numId, queryParams, selectedProvider, sourceParam]);
 
-    const handleTorrentFallback = useCallback(async () => {
+    const handleTorrentFallback = useCallback(() => {
         if (!data?.imdb_id) return;
-        setTorrentFallbackLoading(true);
-        try {
-            const type = mediaType === 'movie' ? 'movie' : 'series';
-            const idPath = mediaType === 'movie'
-                ? data.imdb_id
-                : `${data.imdb_id}:${meta?.season ?? 1}:${meta?.episode ?? 1}`;
-            const res = await fetch(`https://torrentio.strem.fun/stream/${type}/${idPath}.json`, {
-                signal: AbortSignal.timeout(8000)
-            });
-            const json = await res.json();
-            const streams = json?.streams || [];
-            if (streams.length === 0) {
-                toast({ title: "No torrents found", description: "No torrentio streams available for this title.", variant: "destructive" });
-                return;
-            }
-            const pick = (() => {
-                const QUAL = ['1080p', '720p', '4K', 'HD'];
-                for (const q of QUAL) {
-                    const match = streams.find((s: any) =>
-                        ((s.name ?? '') + ' ' + (s.title ?? '')).toLowerCase().includes(q.toLowerCase())
-                    );
-                    if (match) return match;
-                }
-                return streams[0];
-            })();
-            const infoHash = pick.infoHash || pick.url?.match(/btih:([a-fA-F0-9]+)/)?.[1];
-            if (!infoHash) {
-                toast({ title: "No usable torrent", description: "Could not extract info hash from torrentio response.", variant: "destructive" });
-                return;
-            }
-            const magnetUrl = pick.url || `magnet:?xt=urn:btih:${infoHash}`;
-            
-            // Try to start the native engine for this torrent
-            try {
-                const mediaData = {
-                    id: numId,
-                    mediaType: mediaType as 'movie' | 'tv',
-                    title: data.title || data.name || '',
-                    posterPath: data.poster_path,
-                    backdropPath: data.backdrop_path,
-                    year: data.release_date?.split('-')[0] || data.first_air_date?.split('-')[0] || '',
-                    rating: data.vote_average,
-                    genres: data.genres?.map((g: any) => g.name) || [],
-                    status: data.status,
-                };
-                await startDownload(mediaData as any, magnetUrl);
-            } catch (engineErr) {
-                console.error("Failed to start native P2P stream engine, falling back...", engineErr);
-            }
-
-            const next = new URLSearchParams(queryParams);
-            next.set("source", "torrentio");
-            next.set("infoHash", infoHash);
-            navigate(`/watch/${numId}?${next.toString()}`, { replace: true });
-        } catch (e) {
-            console.error("Torrent fallback failed:", e);
-            toast({ title: "Torrent fallback failed", description: "Could not fetch torrentio streams.", variant: "destructive" });
-        } finally {
-            setTorrentFallbackLoading(false);
-        }
-    }, [data, mediaType, numId, queryParams, meta, navigate, toast]);
+        const next = new URLSearchParams(queryParams);
+        next.set("source", "torrentio");
+        next.delete("infoHash"); // Ensure we show the quality selector
+        navigate(`/watch/${numId}?${next.toString()}`, { replace: true });
+    }, [data, numId, queryParams, navigate]);
 
     useEffect(() => {
         setProviderFailed(false);
@@ -242,7 +186,7 @@ const PlayerPage = () => {
     useEffect(() => {
         const hash = queryParams.get("infoHash");
         const mirrorRaw = queryParams.get("mirror");
-        const mirror = mirrorRaw || (isTauri ? "native" : "webtor");
+        const mirror = mirrorRaw || "webtor";
 
         if (sourceParam === "torrentio" && hash && mirror === "native") {
             const magnetUrl = `magnet:?xt=urn:btih:${hash}`;
@@ -288,6 +232,17 @@ const PlayerPage = () => {
 
             retryP2p.current = initP2pStream;
             initP2pStream();
+
+            return () => {
+                // Cleanup: Stop the specific torrent stream when player unmounts or source changes
+                if (isTauri) {
+                    import("@tauri-apps/api/core").then(({ invoke }) => {
+                        invoke("stop_torrent_engine", { infoHash: hash }).catch(console.error);
+                    });
+                } else {
+                    fetch(`http://127.0.0.1:8083/p2p-proxy/torrents/${hash.toLowerCase()}/delete`, { method: 'POST' }).catch(console.error);
+                }
+            };
         } else {
             setP2pLoading(false);
             setP2pError(null);
@@ -386,7 +341,7 @@ const PlayerPage = () => {
                             {sourceParam === "torrentio" && infoHash && (
                                 <DropdownMenu>
                                     <DropdownMenuTrigger className="flex items-center gap-1 text-purple-400/80 text-[10px] uppercase tracking-widest hover:text-purple-300 transition-colors focus:outline-none animate-pulse">
-                                        Mirror: {queryParams.get("mirror") || (isTauri ? "native" : "webtor")}
+                                        Mirror: {queryParams.get("mirror") || "webtor"}
                                         <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
                                     </DropdownMenuTrigger>
                                     <DropdownMenuContent align="start" className="bg-[#1C1C1E] border-white/10 text-white min-w-[180px]">
@@ -397,7 +352,7 @@ const PlayerPage = () => {
                                                     next.set("mirror", "native");
                                                     navigate(`/watch/${numId}?${next.toString()}`, { replace: true });
                                                 }}
-                                                className={`cursor-pointer ${(!queryParams.get("mirror") || queryParams.get("mirror") === "native") ? 'bg-white/10' : ''}`}
+                                                className={`cursor-pointer ${queryParams.get("mirror") === "native" ? 'bg-white/10' : ''}`}
                                             >
                                                 Native Torrent Stream (Local)
                                             </DropdownMenuItem>
@@ -408,7 +363,7 @@ const PlayerPage = () => {
                                                 next.set("mirror", "webtor");
                                                 navigate(`/watch/${numId}?${next.toString()}`, { replace: true });
                                             }}
-                                            className={`cursor-pointer ${queryParams.get("mirror") === "webtor" ? 'bg-white/10' : ''}`}
+                                            className={`cursor-pointer ${(!queryParams.get("mirror") || queryParams.get("mirror") === "webtor") ? 'bg-white/10' : ''}`}
                                         >
                                             Webtor Player (Iframe)
                                         </DropdownMenuItem>

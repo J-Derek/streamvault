@@ -14,5 +14,13 @@ commands.allow = [
     "finalize_p2p_download",
     "delete_media_file",
     "resolve_p2p_file",
-    "resolve_p2p_file_by_hash"
+    "resolve_p2p_file_by_hash",
+    "scan_local_library",
+    "db_save_download",
+    "db_get_download",
+    "db_list_downloads",
+    "db_remove_download",
+    "sync_download_path",
+    "stop_torrent_engine",
+    "get_playable_url"
 ]

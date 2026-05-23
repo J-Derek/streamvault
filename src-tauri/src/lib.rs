@@ -233,6 +233,40 @@ async fn wait_for_engine(client: &Client) -> Result<(), String> {
     Err("P2P engine (rqbit) not responding after 7.5s. Is the binary running?".into())
 }
 
+async fn remove_torrent_from_engine_and_registry(
+    app: &AppHandle,
+    state: &State<'_, TorrentState>,
+    id: u32,
+    fallback_hash: Option<String>,
+    purge_files: bool,
+) {
+    let mut info_hash = fallback_hash;
+
+    // 1. Remove from memory mapping and write to registry
+    {
+        let mut map = state.id_to_info.lock().unwrap();
+        if let Some(info) = map.remove(&id) {
+            if info_hash.is_none() {
+                info_hash = Some(info.info_hash.clone());
+            }
+        }
+        let registry_path = app.path().app_data_dir()
+            .unwrap_or_default()
+            .join("p2p_registry.json");
+        if let Ok(json) = serde_json::to_string(&*map) {
+            let _ = std::fs::write(&registry_path, json);
+        }
+    }
+
+    // 2. Remove from rqbit engine if still active
+    if let Some(hash) = info_hash {
+        let endpoint = if purge_files { "delete" } else { "forget" };
+        let _ = state.client.post(format!("http://127.0.0.1:3030/torrents/{}/{}", hash.to_lowercase(), endpoint))
+            .send().await;
+        log::info!("Cleaned/stopped torrent on P2P engine ({}): {}", endpoint, hash);
+    }
+}
+
 #[tauri::command]
 async fn start_p2p_download(
     app: AppHandle,
@@ -291,6 +325,12 @@ async fn start_p2p_download(
     {
         let mut map = state.id_to_info.lock().unwrap();
         map.insert(id, TorrentInfo { info_hash: info_hash.clone(), file_index });
+        let registry_path = app.path().app_data_dir()
+            .unwrap_or_default()
+            .join("p2p_registry.json");
+        if let Ok(json) = serde_json::to_string(&*map) {
+            let _ = std::fs::write(&registry_path, json);
+        }
     }
 
     // 2. Spawn telemetry loop
@@ -353,21 +393,7 @@ async fn stop_p2p_download(
     state: tauri::State<'_, TorrentState>,
     id: u32,
 ) -> Result<(), String> {
-    let info = {
-        let map = state.id_to_info.lock().unwrap();
-        map.get(&id).cloned()
-    };
-
-    if let Some(i) = info {
-        let _ = state.client.delete(format!("http://127.0.0.1:3030/torrents/{}", i.info_hash.to_lowercase()))
-            .send().await;
-    }
-
-    {
-        let mut map = state.id_to_info.lock().unwrap();
-        map.remove(&id);
-    }
-
+    remove_torrent_from_engine_and_registry(&app, &state, id, None, false).await;
     Ok(())
 }
 
@@ -473,13 +499,16 @@ async fn delete_media_file(
     state: tauri::State<'_, TorrentState>,
     id: u32,
 ) -> Result<(), String> {
-    // 1. Remove DB record first (get file_path before it's gone)
+    let mut info_hash = None;
+
+    // 1. Remove DB record first (get file_path and info_hash before it's gone)
     if let Ok(Some(record)) = state.download_db.get(id as i64) {
         // Delete the actual video file from disk
         let path = std::path::Path::new(&record.file_path);
         if path.exists() {
             let _ = std::fs::remove_file(path);
         }
+        info_hash = record.info_hash.clone();
         // Remove from SQLite
         let _ = state.download_db.remove(id as i64);
     }
@@ -492,17 +521,9 @@ async fn delete_media_file(
         }
     }
 
-    // 3. Remove from memory mapping
-    let info = {
-        let mut map = state.id_to_info.lock().unwrap();
-        map.remove(&id)
-    };
+    // 3. Remove from engine, mapping, and registry using helper
+    remove_torrent_from_engine_and_registry(&app, &state, id, info_hash, true).await;
 
-    // 4. Remove from rqbit engine if still active
-    if let Some(i) = info {
-        let _ = state.client.delete(format!("http://127.0.0.1:3030/torrents/{}", i.info_hash.to_lowercase()))
-            .send().await;
-    }
     Ok(())
 }
 
@@ -642,12 +663,7 @@ async fn finalize_p2p_download(
 
     
 
-    let _ = state.client.delete(format!("http://127.0.0.1:3030/torrents/{}", info_hash.to_lowercase())).send().await;
-
-    {
-        let mut map = state.id_to_info.lock().unwrap();
-        map.remove(&id);
-    }
+    remove_torrent_from_engine_and_registry(&app, &state, id, Some(info_hash), false).await;
 
     Ok(FinalizeResult { file_path })
 }
@@ -800,6 +816,7 @@ async fn spawn_p2p_engine(app: AppHandle, state: tauri::State<'_, TorrentState>)
             "--disable-dht",
             "--listen-port", "4241",
             "server", "start",
+            "--disable-persistence",
         ])
         .arg(&streamvault_dir)
         .stdout(Stdio::inherit())
@@ -849,11 +866,9 @@ async fn spawn_p2p_engine(app: AppHandle, state: tauri::State<'_, TorrentState>)
                                         let hash = t["info_hash"].as_str().unwrap_or("").to_lowercase();
                                         if hash.is_empty() { continue; }
 
-
-
                                         // Remove orphaned torrents (not in the frontend registry)
                                         if !known_hashes.contains(&hash) {
-                                            let _ = client.delete(format!("http://127.0.0.1:3030/torrents/{}", hash))
+                                            let _ = client.post(format!("http://127.0.0.1:3030/torrents/{}/delete", hash))
                                                 .send().await;
                                             log::info!("Auto-cleaned orphaned torrent: {}", hash);
                                             cleaned += 1;
@@ -987,6 +1002,7 @@ async fn sync_download_path(
 ) -> Result<String, String> {
     let details_url = format!("http://127.0.0.1:3030/torrents/{}", info_hash.to_lowercase());
     let mut file_path = String::new();
+    let mut file_size: Option<i64> = None;
 
     if let Ok(details_res) = state.client.get(&details_url).send().await {
         if let Ok(full_details) = details_res.json::<serde_json::Value>().await {
@@ -1018,6 +1034,7 @@ async fn sync_download_path(
                             }
                         }
                         file_path = path_buf.to_string_lossy().to_string();
+                        file_size = Some(max_size as i64);
                     }
                 }
             }
@@ -1028,32 +1045,70 @@ async fn sync_download_path(
         return Err("Could not resolve file path from rqbit".into());
     }
 
-    // Update DB with the found path even before download finishes
-    let mut record = match state.download_db.get(id as i64) {
-        Ok(Some(r)) => r,
-        _ => crate::db::DownloadRecord {
-            id: id as i64,
-            title: format!("Media {}", id),
-            year: None,
-            file_path: String::new(),
-            file_size: None,
-            info_hash: Some(info_hash.clone()),
-            status: "downloading".to_string(),
-            downloaded_at: String::new(),
-        }
+    // Retrieve existing record first if it exists to preserve title, year, etc.
+    let (existing_title, existing_year, existing_size) = if let Ok(Some(existing)) = state.download_db.get(id as i64) {
+        (existing.title, existing.year, existing.file_size)
+    } else {
+        (String::new(), None, None)
     };
-    record.file_path = file_path.clone();
-    let _ = state.download_db.upsert(&record);
+
+    let new_record = crate::db::DownloadRecord {
+        id: id as i64,
+        title: if existing_title.is_empty() { format!("Media {}", id) } else { existing_title },
+        year: existing_year,
+        file_path: file_path.clone(),
+        file_size: file_size.or(existing_size),
+        info_hash: Some(info_hash.to_lowercase()),
+        status: "complete".to_string(),
+        downloaded_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let _ = state.download_db.upsert(&new_record);
+
+    // Completely remove the torrent job from the engine, from memory, and from the registry.
+    // This stops seeding and frees it so it doesn't seed or show up in the engine anymore,
+    // while keeping the downloaded file fully intact.
+    remove_torrent_from_engine_and_registry(&app, &state, id, Some(info_hash), false).await;
 
     Ok(file_path)
 }
 
 #[tauri::command]
 async fn stop_torrent_engine(
+    app: AppHandle,
     state: tauri::State<'_, TorrentState>,
     info_hash: String,
 ) -> Result<(), String> {
-    let _ = state.client.delete(format!("http://127.0.0.1:3030/torrents/{}", info_hash.to_lowercase())).send().await;
+    // Look up mapped ID in memory to cleanly clean registry
+    let mut mapped_id = None;
+    {
+        let map = state.id_to_info.lock().unwrap();
+        for (id, info) in map.iter() {
+            if info.info_hash.to_lowercase() == info_hash.to_lowercase() {
+                mapped_id = Some(*id);
+                break;
+            }
+        }
+    }
+
+    if let Some(id) = mapped_id {
+        // Check if there is an active background download record for this ID in the database
+        let is_background_download = if let Ok(Some(record)) = state.download_db.get(id as i64) {
+            record.status == "downloading" || record.status == "complete"
+        } else {
+            false
+        };
+
+        if !is_background_download {
+            // It was just a stream! Purge it from rqbit AND from registry/memory mapping!
+            remove_torrent_from_engine_and_registry(&app, &state, id, Some(info_hash), true).await;
+        } else {
+            log::info!("Keeping background download active for ID: {}", id);
+        }
+    } else {
+        // If not mapped, just delete the torrent from rqbit directly to be safe
+        let _ = state.client.post(format!("http://127.0.0.1:3030/torrents/{}/delete", info_hash.to_lowercase()))
+            .send().await;
+    }
     Ok(())
 }
 
@@ -1092,8 +1147,154 @@ async fn db_list_downloads(state: tauri::State<'_, TorrentState>) -> Result<Vec<
 }
 
 #[tauri::command]
-async fn db_remove_download(state: tauri::State<'_, TorrentState>, id: i64) -> Result<(), String> {
+async fn db_remove_download(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, TorrentState>,
+    id: i64
+) -> Result<(), String> {
+    let mut info_hash = None;
+
+    if let Ok(Some(record)) = state.download_db.get(id) {
+        let path = std::path::Path::new(&record.file_path);
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+
+        info_hash = record.info_hash.clone();
+
+        if let Some(hash) = &record.info_hash {
+            let mapping_path = app.path().app_data_dir()
+                .unwrap_or_default()
+                .join("p2p_path_map.json");
+            if mapping_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&mapping_path) {
+                    if let Ok(mut map) = serde_json::from_str::<std::collections::HashMap<String, String>>(&content) {
+                        map.remove(hash);
+                        if let Ok(json) = serde_json::to_string(&map) {
+                            let _ = std::fs::write(&mapping_path, json);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    remove_torrent_from_engine_and_registry(&app, &state, id as u32, info_hash, true).await;
+
     state.download_db.remove(id)
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ScannedFile {
+    pub file_path: String,
+    pub parsed_title: String,
+    pub parsed_year: Option<i32>,
+    pub file_size: u64,
+}
+
+#[tauri::command]
+async fn scan_local_library(app: tauri::AppHandle) -> Result<Vec<ScannedFile>, String> {
+    let streamvault_dir = get_streamvault_dir(&app);
+
+    if !streamvault_dir.exists() {
+        return Ok(vec![]);
+    }
+
+    let video_extensions = ["mp4", "mkv", "avi", "webm"];
+    let mut results: Vec<ScannedFile> = Vec::new();
+
+    // Regex to strip torrent tags and extract title + year
+    let tag_regex = regex::Regex::new(
+        r"(?i)[\(\[\{]?(19|20)\d{2}[\)\]\}]?.*$|\b(1080p|720p|480p|4k|2160p|bluray|webrip|hdtv|x264|x265|hevc|aac|yts|yify|rarbg|eztv|mx|web\-dl|dvdrip|brrip|xvid)\b.*$"
+    ).map_err(|e| e.to_string())?;
+
+    let year_regex = regex::Regex::new(r"(19|20)\d{2}")
+        .map_err(|e| e.to_string())?;
+
+    fn walk_dir(
+        dir: &std::path::Path,
+        video_extensions: &[&str],
+        tag_regex: &regex::Regex,
+        year_regex: &regex::Regex,
+        results: &mut Vec<ScannedFile>,
+    ) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            if path.is_dir() {
+                walk_dir(&path, video_extensions, tag_regex, year_regex, results);
+                continue;
+            }
+
+            if path.is_file() {
+                let ext = path.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+
+                if !video_extensions.contains(&ext.as_str()) {
+                    continue;
+                }
+
+                // Use parent folder name if filename looks like a hash/code,
+                // otherwise use the filename stem
+                let stem = path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let raw_name = if stem.len() < 5 || stem.chars().all(|c| c.is_alphanumeric()) {
+                    // Looks like a hash, use parent folder name instead
+                    path.parent()
+                        .and_then(|p| p.file_name())
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&stem)
+                        .to_string()
+                } else {
+                    stem.replace('.', " ").replace('_', " ")
+                };
+
+                // Extract year before stripping tags
+                let parsed_year = year_regex.find(&raw_name)
+                    .and_then(|m| m.as_str().parse::<i32>().ok());
+
+                // Strip tags to get clean title
+                let parsed_title = tag_regex.replace(&raw_name, "")
+                    .trim()
+                    .trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_string();
+
+                if parsed_title.is_empty() {
+                    continue;
+                }
+
+                let file_size = entry.metadata()
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+
+                // Skip files smaller than 50MB (likely samples or extras)
+                if file_size < 50 * 1024 * 1024 {
+                    continue;
+                }
+
+                results.push(ScannedFile {
+                    file_path: path.to_string_lossy().to_string(),
+                    parsed_title,
+                    parsed_year,
+                    file_size,
+                });
+            }
+        }
+    }
+
+    walk_dir(&streamvault_dir, &video_extensions, &tag_regex, &year_regex, &mut results);
+
+    Ok(results)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1122,11 +1323,21 @@ pub fn run() {
     })
     .build();
 
-  tauri::Builder::default()
+  let app = tauri::Builder::default()
     .plugin(nav_plugin)
     .plugin(tauri_plugin_log::Builder::default().build())
     .plugin(tauri_plugin_fs::init())
     .setup(|app| {
+      #[cfg(target_os = "windows")]
+      {
+          let _ = std::process::Command::new("taskkill")
+              .args(["/F", "/IM", "rqbit-x86_64-pc-windows-msvc.exe"])
+              .output();
+          let _ = std::process::Command::new("taskkill")
+              .args(["/F", "/IM", "rqbit.exe"])
+              .output();
+      }
+
       let app_handle = app.handle().clone();
       let app_data = app_handle.path().app_data_dir().unwrap();
       let streamvault_dir = get_streamvault_dir(&app_handle);
@@ -1381,11 +1592,11 @@ pub fn run() {
                   let response = thread::spawn(move || {
                       let rt = tokio::runtime::Runtime::new().unwrap();
                       rt.block_on(async {
-                          let rb = if method == tiny_http::Method::Post {
-                              client.post(&target_url).body(body_bytes)
-                          } else {
-                              client.get(&target_url)
-                          };
+                           let rb = match method {
+                               tiny_http::Method::Post => client.post(&target_url).body(body_bytes),
+                               tiny_http::Method::Delete => client.delete(&target_url),
+                               _ => client.get(&target_url),
+                           };
 
                           match rb.send().await {
                               Ok(res) => {
@@ -1432,8 +1643,21 @@ pub fn run() {
             stop_torrent_engine,
             get_playable_url,
       db_list_downloads,
-      db_remove_download
+      db_remove_download,
+      scan_local_library
     ])
-    .run(tauri::generate_context!())
-    .expect("error while running tauri application");
+    .build(tauri::generate_context!())
+    .expect("error while building tauri application");
+
+  app.run(move |app_handle, event| {
+    if let tauri::RunEvent::Exit = event {
+        let state = app_handle.state::<TorrentState>();
+        let mut process_guard = state.sidecar_process.lock().unwrap();
+        if let Some(mut child) = process_guard.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            log::info!("Sidecar process terminated successfully on app exit.");
+        }
+    }
+  });
 }

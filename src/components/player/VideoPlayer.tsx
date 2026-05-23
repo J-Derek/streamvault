@@ -26,6 +26,7 @@ const VideoPlayer = ({ isOffline, offlineSrc, vidsrcUrl, title, containerRef, on
     const videoRef = useRef<HTMLVideoElement>(null);
     const [showUI, setShowUI] = useState(true);
     const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const webtorContainerRef = useRef<HTMLDivElement>(null);
 
     // Offline player state
     const [isPlaying, setIsPlaying] = useState(false);
@@ -137,6 +138,86 @@ const VideoPlayer = ({ isOffline, offlineSrc, vidsrcUrl, title, containerRef, on
     // Notify parent of playing state changes
     useEffect(() => { onPlayingChange?.(isPlaying); }, [isPlaying]);
 
+    // Webtor SDK Loader & Handler
+    useEffect(() => {
+        if (!vidsrcUrl || !vidsrcUrl.includes("webtor.io")) return;
+
+        // Clear target container first and prepare a clean DOM node
+        if (webtorContainerRef.current) {
+            webtorContainerRef.current.innerHTML = "";
+            const target = document.createElement("div");
+            target.id = "webtor-player-target";
+            target.className = "webtor w-full h-full relative";
+            webtorContainerRef.current.appendChild(target);
+        }
+
+        // Setup custom responsive styles for parent context
+        const styleId = "webtor-layout-fix";
+        let style = document.getElementById(styleId);
+        if (!style) {
+            style = document.createElement("style");
+            style.id = styleId;
+            style.innerHTML = `
+                .webtor, #webtor-player-target {
+                    width: 100% !important;
+                    height: 100% !important;
+                    min-height: 100% !important;
+                }
+            `;
+            document.head.appendChild(style);
+        }
+
+        // Load the official Webtor SDK asynchronously via jsDelivr CDN for reliability
+        let script = document.querySelector('script[src="https://cdn.jsdelivr.net/npm/@webtor/embed-sdk-js/dist/index.min.js"]') as HTMLScriptElement;
+        if (!script) {
+            script = document.createElement("script");
+            script.src = "https://cdn.jsdelivr.net/npm/@webtor/embed-sdk-js/dist/index.min.js";
+            script.async = true;
+            script.charset = "utf-8";
+            document.body.appendChild(script);
+        }
+
+        // Extract magnet from url
+        const magnetMatch = vidsrcUrl.match(/(magnet:\?xt=urn:btih:[a-zA-Z0-9]+)/i);
+        const magnet = magnetMatch ? magnetMatch[1] : "";
+        if (!magnet) return;
+
+        const initWebtor = () => {
+            try {
+                (window as any).webtor = (window as any).webtor || [];
+                (window as any).webtor.push({
+                    id: "webtor-player-target",
+                    magnet: magnet,
+                    width: "100%",
+                    height: "100%",
+                    theme: "dark",
+                    onReady: () => {
+                        console.log("Webtor Player SDK loaded successfully.");
+                        if (onIframeLoad) onIframeLoad();
+                    }
+                });
+            } catch (err) {
+                console.error("Failed to initialize Webtor SDK:", err);
+            }
+        };
+
+        if ((window as any).webtor && (window as any).webtor.push) {
+            initWebtor();
+        } else {
+            script.onload = () => {
+                initWebtor();
+            };
+        }
+
+        return () => {
+            if (webtorContainerRef.current) {
+                webtorContainerRef.current.innerHTML = "";
+            }
+        };
+    }, [vidsrcUrl, onIframeLoad]);
+
+    const isWebtor = vidsrcUrl?.includes("webtor.io");
+
     const videoElement = isOffline ? (
         <video
             ref={videoRef}
@@ -172,6 +253,8 @@ const VideoPlayer = ({ isOffline, offlineSrc, vidsrcUrl, title, containerRef, on
         >
             <p className="text-white">Your browser does not support HTML5 video.</p>
         </video>
+    ) : isWebtor ? (
+        <div ref={webtorContainerRef} className="w-full h-full relative" />
     ) : vidsrcUrl ? (
         <iframe
             src={vidsrcUrl}

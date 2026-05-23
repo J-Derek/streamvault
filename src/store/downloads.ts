@@ -38,13 +38,13 @@ interface DownloadState {
     removeTask: (taskKey: string) => Promise<void>;
     updateProgress: (taskKey: string, progress: number, downloadedBytes?: number, totalSize?: number, speed?: string, peers?: number) => void;
     setStatus: (taskKey: string, status: DownloadStatus, error?: string) => void;
-    completeDownload: (taskKey: string, pathOrBlob: string, size: number) => void;
+    completeDownload: (taskKey: string, pathOrBlob: string, size: number, directMedia?: StreamVaultMedia) => void;
     completeEpisodeDownload: (episodeKey: string, taskKey: string, pathOrBlob: string, size: number) => void;
     removeEpisodeDownload: (episodeKey: string) => Promise<void>;
     setP2pReady: (ready: boolean) => void;
     setGlobalStats: (stats: GlobalStats) => void;
     deleteOfflineItem: (id: number) => Promise<void>;
-    clearTasks: () => void;
+    clearTasks: () => Promise<void>;
     syncWithDisk: () => Promise<void>;
 }
 
@@ -135,20 +135,22 @@ export const useDownloadStore = create<DownloadState>()(
                 });
             },
 
-            completeDownload: async (taskKey, pathOrBlob, size) => {
+            completeDownload: async (taskKey, pathOrBlob, size, directMedia?) => {
                 const state = get();
                 const task = state.tasks[taskKey];
-                if (!task) return;
+                const media = directMedia || task?.media;
+                if (!media) return;
 
                 const isTauri = typeof window !== 'undefined' &&
                     ('__TAURI_INTERNALS__' in window || '__TAURI__' in window || 'isTauri' in window);
 
+                const finalPath = (pathOrBlob && pathOrBlob !== 'p2p-engine') ? pathOrBlob : (task?.downloadPath || '');
                 const completedTask: DownloadTask = {
-                    ...task,
+                    media,
                     status: 'completed' as DownloadStatus,
                     progress: 100,
                     size,
-                    filePath: isTauri ? pathOrBlob : undefined,
+                    filePath: isTauri ? finalPath : undefined,
                     blobId: !isTauri ? pathOrBlob : undefined,
                 };
 
@@ -157,7 +159,7 @@ export const useDownloadStore = create<DownloadState>()(
 
                 const newLibrary = {
                     ...state.offlineLibrary,
-                    [task.media.id]: completedTask
+                    [media.id]: completedTask
                 };
 
                 saveToDisk('downloads', { tasks: newTasks, offlineLibrary: newLibrary, episodeLibrary: state.episodeLibrary });
@@ -165,17 +167,17 @@ export const useDownloadStore = create<DownloadState>()(
                 set({ tasks: newTasks, offlineLibrary: newLibrary });
 
                 // Persist to SQLite database (single source of truth)
-                if (isTauri && task.media) {
+                if (isTauri) {
                     try {
                         const { invoke } = await import('@tauri-apps/api/core');
                         await invoke('db_save_download', {
                             record: {
-                                id: task.media.id,
-                                title: task.media.title || task.media.name || `Movie ${task.media.id}`,
-                                year: task.media.year ? parseInt(String(task.media.year)) : null,
-                                file_path: pathOrBlob || '',
+                                id: media.id,
+                                title: media.title || media.name || `Movie ${media.id}`,
+                                year: media.year ? parseInt(String(media.year)) : null,
+                                file_path: finalPath,
                                 file_size: size || null,
-                                info_hash: task.infoHash || null,
+                                info_hash: task?.infoHash || null,
                                 status: 'complete',
                                 downloaded_at: new Date().toISOString(),
                             }
@@ -274,7 +276,20 @@ export const useDownloadStore = create<DownloadState>()(
                 });
             },
 
-            clearTasks: () => {
+            clearTasks: async () => {
+                const isTauri = typeof window !== 'undefined' &&
+                    ('__TAURI_INTERNALS__' in window || '__TAURI__' in window || 'isTauri' in window);
+
+                if (isTauri) {
+                    try {
+                        const { invoke } = await import("@tauri-apps/api/core");
+                        await invoke("kill_p2p_engine");
+                        console.log("Killed P2P engine because all tasks were cleared.");
+                    } catch (e) {
+                        console.error("Failed to kill P2P engine on clear:", e);
+                    }
+                }
+
                 set((state) => {
                     saveToDisk('downloads', { tasks: {}, offlineLibrary: state.offlineLibrary, episodeLibrary: state.episodeLibrary });
                     return { tasks: {} };

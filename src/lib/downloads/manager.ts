@@ -36,6 +36,11 @@ export const initDownloadManager = async () => {
 
             console.log("DownloadManager: Tauri listeners initialized");
 
+            // Auto-scan library on app launch
+            setTimeout(() => {
+                scanAndSyncLibrary().catch(e => console.error("Auto-scan failed:", e));
+            }, 3000); // Give it a 3s delay so it doesn't block initial rendering
+
             // ── Unified status + progress reconciler (runs in Tauri too) ────────
             const reconcileTorrentStates = async () => {
                 try {
@@ -112,6 +117,9 @@ export const initDownloadManager = async () => {
                                     } finally {
                                         await invoke("stop_torrent_engine", { infoHash: taskHash }).catch(() => {});
                                     }
+
+                                    // Auto-trigger on download completion
+                                    scanAndSyncLibrary().catch(console.error);
 
                                     // Check if this was the last active task
                                     const freshState = useDownloadStore.getState();
@@ -542,7 +550,92 @@ function pathExists(filePath: string): Promise<boolean> {
         const xhr = new XMLHttpRequest();
         xhr.open('HEAD', `http://127.0.0.1:8083/p2p-stream/${encodeFilePath(filePath)}`);
         xhr.onload = () => resolve(xhr.status === 200 || xhr.status === 206);
-        xhr.onerror = () => resolve(false);
         xhr.send();
     });
+}
+
+export interface ScannedFile {
+    file_path: string;
+    parsed_title: string;
+    parsed_year: number | null;
+    file_size: number;
+}
+
+export async function scanAndSyncLibrary(): Promise<void> {
+    const { invoke } = await import('@tauri-apps/api/core');
+    const store = useDownloadStore.getState();
+
+    // 1. Get all video files Rust found
+    const scannedFiles: ScannedFile[] = await invoke('scan_local_library');
+
+    const { searchMovies } = await import('@/lib/tmdb');
+
+    // 2. For each file, search TMDB and upsert to DB
+    for (const file of scannedFiles) {
+        try {
+            // Use existing TMDB search wrapper
+            const results = await searchMovies(file.parsed_title);
+            if (!results || !results.results || results.results.length === 0) continue;
+
+            const match = results.results[0]; // Best match is always first
+
+            // 3. Upsert to SQLite
+            await invoke('db_save_download', {
+                record: {
+                    id: match.id,
+                    title: match.title,
+                    year: match.release_date
+                        ? parseInt(match.release_date.substring(0, 4))
+                        : file.parsed_year,
+                    file_path: file.file_path,
+                    file_size: file.file_size,
+                    info_hash: null,
+                    status: 'complete',
+                    downloaded_at: new Date().toISOString(),
+                }
+            });
+
+            const { normalizeMedia } = await import('@/lib/tmdb-types');
+            const normalized = normalizeMedia(match, 'movie');
+
+            // 4. Sync into Zustand offlineLibrary
+            store.completeDownload(
+                String(match.id),
+                file.file_path,
+                file.file_size,
+                normalized
+            );
+
+        } catch (err) {
+            console.error(`Failed to match "${file.parsed_title}":`, err);
+            // Don't break the loop, continue with next file
+        }
+    }
+
+    // 5. Clean up orphans (files deleted from disk manually)
+    const currentPaths = new Set(
+        scannedFiles.map(f => f.file_path.replace(/\\/g, '/').toLowerCase())
+    );
+    const offlineLibrary = store.offlineLibrary;
+    
+    for (const [idStr, item] of Object.entries(offlineLibrary)) {
+        const normalizedItemPath = item.filePath ? item.filePath.replace(/\\/g, '/').toLowerCase() : "";
+        
+        // If it has no file path, is a placeholder, or the physical file is missing from scanned paths
+        const hasValidFileOnDisk = item.filePath && 
+                                   item.filePath !== "p2p-engine" && 
+                                   currentPaths.has(normalizedItemPath);
+
+        if (!hasValidFileOnDisk) {
+            // Found an item in DB that no longer exists on disk
+            try {
+                const id = Number(idStr);
+                await invoke('db_remove_download', { id });
+                store.deleteOfflineItem(id);
+                console.log(`Removed orphaned record for ID ${id} (${item.filePath})`);
+            } catch (e) {
+                console.error("Failed to remove orphaned item:", e);
+            }
+        }
+    }
 }
