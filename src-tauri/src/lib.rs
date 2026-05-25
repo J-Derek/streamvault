@@ -2055,12 +2055,6 @@ pub fn run() {
               }
               let _ = request.respond(TinyResponse::from_string("StreamVault Native Proxy Active"));
           }
-          },
-          Err(e) => {
-              std::fs::write("proxy_debug.log", format!("Failed to bind proxy server: {}\n", e)).unwrap_or_default();
-              log::error!("Failed to bind proxy server: {}", e);
-          }
-      }
       });
       Ok(())
     })
