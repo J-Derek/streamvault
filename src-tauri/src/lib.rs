@@ -205,6 +205,7 @@ pub struct TorrentState {
     pub id_to_info: Mutex<HashMap<u32, TorrentInfo>>,
     pub client: Client,
     pub download_db: DownloadDb,
+    pub proxy_port: Mutex<u16>,
 }
 
 impl TorrentState {
@@ -217,6 +218,7 @@ impl TorrentState {
             id_to_info: Mutex::new(HashMap::new()),
             client,
             download_db,
+            proxy_port: Mutex::new(8083),
         }
     }
 }
@@ -1463,6 +1465,11 @@ async fn stop_torrent_engine(
 }
 
 #[tauri::command]
+fn get_proxy_port(state: tauri::State<'_, TorrentState>) -> u16 {
+    *state.proxy_port.lock().unwrap()
+}
+
+#[tauri::command]
 async fn get_playable_url(
     state: tauri::State<'_, TorrentState>,
     id: u32,
@@ -1473,7 +1480,8 @@ async fn get_playable_url(
             // Encode the path for local proxy
             use url::form_urlencoded;
             let encoded: String = form_urlencoded::byte_serialize(record.file_path.as_bytes()).collect();
-            return Ok(format!("http://127.0.0.1:8083/p2p-stream/?path={}", encoded));
+            let port = *state.proxy_port.lock().unwrap();
+            return Ok(format!("http://127.0.0.1:{}/p2p-stream/?path={}", port, encoded));
         }
     }
     Err("File not found on disk or in DB".into())
@@ -1769,12 +1777,31 @@ pub fn run() {
       let app_handle_for_server = app.handle().clone();
       thread::spawn(move || {
           println!("=== PROXY THREAD STARTED ===");
-          log::info!("Starting proxy server on 127.0.0.1:8083...");
-          match Server::http("127.0.0.1:8083") {
-              Ok(server) => {
-                  println!("=== PROXY BOUND SUCESSFULLY ===");
-                  log::info!("Proxy server bound successfully to 127.0.0.1:8083");
-                  for mut request in server.incoming_requests() {
+          let mut proxy_port = 8083u16;
+          let server = loop {
+              match Server::http(format!("127.0.0.1:{}", proxy_port)) {
+                  Ok(s) => break s,
+                  Err(_) => {
+                      proxy_port += 1;
+                      if proxy_port > 8090 {
+                          eprintln!("Could not bind proxy server on any port 8083-8090");
+                          return;
+                      }
+                  }
+              }
+          };
+
+          println!("=== PROXY BOUND SUCESSFULLY ON PORT {} ===", proxy_port);
+          log::info!("Proxy server bound successfully to 127.0.0.1:{}", proxy_port);
+
+          // Store the port in TorrentState
+          {
+              let state = app_handle_for_server.state::<TorrentState>();
+              let mut port_lock = state.proxy_port.lock().unwrap();
+              *port_lock = proxy_port;
+          }
+
+          for mut request in server.incoming_requests() {
                       let url = request.url().to_string();
                       
                       // Handle OPTIONS requests (CORS preflight) site-wide
@@ -2062,7 +2089,8 @@ pub fn run() {
       db_remove_download,
       scan_local_library,
       remux_to_mp4,
-      find_subtitle_files
+      find_subtitle_files,
+      get_proxy_port
     ])
     .build(tauri::generate_context!())
     .expect("error while building tauri application");

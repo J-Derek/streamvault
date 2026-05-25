@@ -54,7 +54,10 @@ const isTauri = !!(
     (typeof window !== 'undefined' && ('__TAURI_INTERNALS__' in window || '__TAURI__' in window || 'isTauri' in window))
 );
 
-const P2P_BASE = "http://127.0.0.1:8083/p2p-proxy";
+let proxyPort = 8083;
+export let P2P_BASE = "http://127.0.0.1:8083/p2p-proxy";
+
+export const getProxyPort = () => proxyPort;
 
 const setSeasonPackPriorities = async (
     infoHash: string,
@@ -222,7 +225,7 @@ const triggerActualDownload = async (taskKey: string, task: any) => {
         // Web flow
         if (magnetUrl || (streamUrl && streamUrl.startsWith('magnet:'))) {
             const finalMagnet = magnetUrl || streamUrl!;
-            const p2pBase = 'http://127.0.0.1:8083/p2p-proxy';
+            const p2pBase = `http://127.0.0.1:${proxyPort}/p2p-proxy`;
             try {
                 const res = await fetch(`${p2pBase}/torrents`, {
                     method: 'POST',
@@ -295,6 +298,16 @@ export const initDownloadManager = async () => {
             // Late import to avoid issues in pure web
             const { listen } = await import("@tauri-apps/api/event");
             const { invoke } = await import("@tauri-apps/api/core");
+
+            // Query dynamic proxy port from Rust backend
+            try {
+                proxyPort = await invoke<number>("get_proxy_port");
+                P2P_BASE = `http://127.0.0.1:${proxyPort}/p2p-proxy`;
+                console.log(`DownloadManager: Dynamic proxy port loaded: ${proxyPort}`);
+            } catch (e) {
+                console.error("DownloadManager: Failed to fetch proxy port, using default 8083:", e);
+            }
+
             await listen("download-progress", (event: any) => {
                 const { id, progress, downloaded_bytes, total_bytes, speed, peers } = event.payload;
                 const state = useDownloadStore.getState();
@@ -751,7 +764,7 @@ export const getOfflineStreamUrl = async (id: number, season?: number, episode?:
     console.log("[getOfflineStreamUrl] Selected filePath:", filePath);
 
     if (isTauri && filePath) {
-        return `http://127.0.0.1:8083/p2p-stream/?path=${encodeFilePath(filePath)}`;
+        return `http://127.0.0.1:${proxyPort}/p2p-stream/?path=${encodeFilePath(filePath)}`;
     }
 
     // Web fallback
@@ -768,7 +781,7 @@ export const getOfflineStreamUrl = async (id: number, season?: number, episode?:
 function pathExists(filePath: string): Promise<boolean> {
     return new Promise((resolve) => {
         const xhr = new XMLHttpRequest();
-        xhr.open('HEAD', `http://127.0.0.1:8083/p2p-stream/${encodeFilePath(filePath)}`);
+        xhr.open('HEAD', `http://127.0.0.1:${proxyPort}/p2p-stream/${encodeFilePath(filePath)}`);
         xhr.onload = () => resolve(xhr.status === 200 || xhr.status === 206);
         xhr.send();
     });

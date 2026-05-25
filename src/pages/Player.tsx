@@ -6,7 +6,7 @@ import { getMovieDetails, getTVDetails, getExternalIds } from "@/lib/tmdb";
 import { Button } from "@/components/ui/button";
 
 import { normalizeMedia, PROVIDERS } from "@/lib/tmdb-types";
-import { getOfflineStreamUrl, startDownload } from "@/lib/downloads/manager";
+import { getOfflineStreamUrl, startDownload, getProxyPort } from "@/lib/downloads/manager";
 import { useDownloadStore } from "@/store/downloads";
 import { useToast } from "@/components/ui/use-toast";
 import { TorrentSelector } from "@/components/player/TorrentSelector";
@@ -79,7 +79,7 @@ const PlayerPage = () => {
                 const match = finalOfflineUrl.match(/\/torrents\/([a-fA-F0-9]+)\/stream/);
                 if (match && match[1]) {
                     try {
-                        const r = await fetch(`http://localhost:8083/p2p-proxy/torrents/${match[1]}`);
+                        const r = await fetch(`http://localhost:${getProxyPort()}/p2p-proxy/torrents/${match[1]}`);
                         if (r.ok) {
                             const torrentData = await r.json();
                             if (torrentData.files && torrentData.files.length > 0) {
@@ -231,7 +231,7 @@ const PlayerPage = () => {
                 } else {
                     try {
                         console.log("PlayerPage: Sending web P2P start request for hash:", hash);
-                        await fetch(`http://127.0.0.1:8083/p2p-proxy/torrents?is_url=true`, {
+                        await fetch(`http://127.0.0.1:${getProxyPort()}/p2p-proxy/torrents?is_url=true`, {
                             method: "POST",
                             headers: { "Content-Type": "text/plain" },
                             body: magnetUrl,
@@ -257,7 +257,7 @@ const PlayerPage = () => {
                         invoke("stop_torrent_engine", { infoHash: hash }).catch(console.error);
                     });
                 } else {
-                    fetch(`http://127.0.0.1:8083/p2p-proxy/torrents/${hash.toLowerCase()}/delete`, { method: 'POST' }).catch(console.error);
+                    fetch(`http://127.0.0.1:${getProxyPort()}/p2p-proxy/torrents/${hash.toLowerCase()}/delete`, { method: 'POST' }).catch(console.error);
                 }
             };
         } else {

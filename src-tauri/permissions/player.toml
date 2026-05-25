@@ -24,5 +24,6 @@ commands.allow = [
     "stop_torrent_engine",
     "get_playable_url",
     "remux_to_mp4",
-    "find_subtitle_files"
+    "find_subtitle_files",
+    "get_proxy_port"
 ]

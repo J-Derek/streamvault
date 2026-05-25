@@ -3,6 +3,7 @@ import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, Maximize, Minimiz
 import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { useSettingsStore } from '@/store/settings';
+import { getProxyPort } from '@/lib/downloads/manager';
 
 import { useToast } from '@/hooks/use-toast';
 
@@ -237,7 +238,7 @@ export default function VideoPlayer({
             
             // Encode the new path to route through proxy
             const encoded = btoa(unescape(encodeURIComponent(newPath)));
-            setRemuxedSrc(`http://127.0.0.1:8083/p2p-stream/?path=${encoded}`);
+            setRemuxedSrc(`http://127.0.0.1:${getProxyPort()}/p2p-stream/?path=${encoded}`);
             setPlaybackStage('remuxed');
             
             toast({
@@ -808,7 +809,7 @@ export default function VideoPlayer({
                         <track 
                             key={idx} 
                             kind="subtitles" 
-                            src={`http://127.0.0.1:8083/p2p-stream/?path=${encoded}`} 
+                            src={`http://127.0.0.1:${getProxyPort()}/p2p-stream/?path=${encoded}`} 
                             label={`Subtitle ${idx + 1}`} 
                         />
                     );
