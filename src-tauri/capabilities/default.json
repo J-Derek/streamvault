@@ -23,6 +23,10 @@
     "fs:allow-exists",
     "fs:allow-mkdir",
     "log:default",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-set-decorations",
+    "core:window:allow-maximize",
+    "core:window:allow-is-fullscreen",
     "player-commands"
   ]
 }

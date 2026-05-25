@@ -90,6 +90,7 @@ coverage
 *.exe
 *.pdb
 !src-tauri/bin/*.exe
+src-tauri/bin/ffmpeg-x86_64-pc-windows-msvc.exe
 
 # Test scripts and doc files
 test_*.js
@@ -102,3 +103,6 @@ test_*.rs
 
 # Agent config files
 AGENTS.md
+
+# Agent Artifacts
+artifacts/

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Route, Routes } from "react-router-dom";
+import { BrowserRouter, Route, Routes, useLocation } from "react-router-dom";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import {
@@ -15,17 +15,11 @@ import Discover from "./pages/Discover.tsx";
 import Search from "./pages/Search.tsx";
 import TitleDetail from "./pages/TitleDetail.tsx";
 import Watchlist from "./pages/Watchlist.tsx";
-import Social from "./pages/Social.tsx";
-import SocialRoom from "./pages/SocialRoom.tsx";
+import Preview from "./pages/Preview.tsx";
 import Player from "./pages/Player.tsx";
-import TimeFilter from "./pages/discover/TimeFilter.tsx";
-import Recommendations from "./pages/discover/Recommendations.tsx";
-import VibeDetect from "./pages/discover/VibeDetect.tsx";
-import SwipeMatch from "./pages/discover/SwipeMatch.tsx";
-import KeywordExplorer from "./pages/discover/KeywordExplorer.tsx";
-import HiddenGems from "./pages/discover/HiddenGems.tsx";
 import Downloads from "./pages/Downloads.tsx";
 import Settings from "./pages/Settings.tsx";
+import Onboarding from "./pages/Onboarding.tsx";
 import { initDownloadManager } from "./lib/downloads/manager.ts";
 import { useWatchlist } from "./store/watchlist";
 import { useDownloadStore } from "./store/downloads";
@@ -35,9 +29,87 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 
 const queryClient = new QueryClient();
 
+const isTauri = !!(
+  (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.TAURI_ENV_PLATFORM) ||
+  (typeof window !== 'undefined' && ('__TAURI_INTERNALS__' in window || '__TAURI__' in window || 'isTauri' in window))
+);
+
+const MainLayout = ({ children }: { children: React.ReactNode }) => {
+  const location = useLocation();
+  const isPlayer = location.pathname.startsWith("/watch/");
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  useEffect(() => {
+    if (!isTauri) return;
+
+    let unlistenResize: (() => void) | null = null;
+
+    const updateStates = async () => {
+      try {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        const appWindow = getCurrentWindow();
+        const fsState = await appWindow.isFullscreen();
+        setIsFullscreen(fsState);
+        document.body.classList.toggle('is-fullscreen', fsState);
+      } catch (err) {
+        console.error("Failed to check fullscreen state:", err);
+      }
+    };
+
+    const handleTauriFullscreen = (e: Event) => {
+      const customEvent = e as CustomEvent<{ fullscreen: boolean }>;
+      const isFS = !!customEvent.detail?.fullscreen;
+      setIsFullscreen(isFS);
+      document.body.classList.toggle('is-fullscreen', isFS);
+    };
+
+    const setupListeners = async () => {
+      try {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        const appWindow = getCurrentWindow();
+
+        // Initial check
+        await updateStates();
+
+        // Listen for Tauri-native resizing events
+        const unlisten = await appWindow.onResized(updateStates);
+        unlistenResize = unlisten;
+      } catch (err) {
+        console.error("Failed to setup Tauri fullscreen listeners in MainLayout:", err);
+      }
+    };
+
+    setupListeners();
+
+    // Bind standard webview resize, custom fullscreen, and direct tauri-fullscreen events
+    window.addEventListener("resize", updateStates);
+    window.addEventListener("fullscreenchange", updateStates);
+    window.addEventListener("tauri-fullscreen", handleTauriFullscreen);
+
+    return () => {
+      window.removeEventListener("resize", updateStates);
+      window.removeEventListener("fullscreenchange", updateStates);
+      window.removeEventListener("tauri-fullscreen", handleTauriFullscreen);
+      if (unlistenResize) unlistenResize();
+    };
+  }, []);
+
+  return (
+    <div
+      data-layout-padding
+      className="min-h-screen flex flex-col transition-all duration-200"
+    >
+      {children}
+    </div>
+  );
+};
+
 const App = () => {
   const [showResumeDialog, setShowResumeDialog] = useState(false);
   const [pendingTasks, setPendingTasks] = useState<{ key: string; title: string }[]>([]);
+  const [onboarded, setOnboarded] = useState<boolean>(() => {
+    return localStorage.getItem("sv_onboarded") === "true";
+  });
 
   useEffect(() => {
     initDownloadManager();
@@ -67,8 +139,72 @@ const App = () => {
       }
     }, 1200);
 
-    return () => { clearTimeout(timer); clearTimeout(resumeTimer); };
+    const handleGlobalF11 = async (e: KeyboardEvent) => {
+      if (e.key === "F11") {
+        e.preventDefault();
+        if (isTauri) {
+          try {
+            const { getCurrentWindow } = await import("@tauri-apps/api/window");
+            const appWindow = getCurrentWindow();
+            const currentlyFullscreen = await appWindow.isFullscreen();
+            const nextFS = !currentlyFullscreen;
+            
+            // On custom titlebar, decorations are already off by default.
+            // On Win10, toggling fullscreen + decorations ensures taskbar is hidden properly.
+            if (nextFS) {
+              await appWindow.setDecorations(false);
+              await appWindow.setFullscreen(true);
+            } else {
+              await appWindow.setFullscreen(false);
+              await appWindow.setDecorations(true);
+            }
+            
+            // Toggle body class and dispatch custom event
+            document.body.classList.toggle('is-fullscreen', nextFS);
+            window.dispatchEvent(new CustomEvent("tauri-fullscreen", { detail: { fullscreen: nextFS } }));
+            
+            // Dispatch standard web events to immediately update React states
+            setTimeout(() => {
+              window.dispatchEvent(new Event("resize"));
+              window.dispatchEvent(new Event("fullscreenchange"));
+            }, 150);
+          } catch (err) {
+            console.error("Tauri global F11 failed:", err);
+          }
+        } else {
+          if (!document.fullscreenElement) {
+            document.documentElement.requestFullscreen().catch(console.error);
+          } else {
+            document.exitFullscreen().catch(console.error);
+          }
+        }
+      }
+    };
+
+    window.addEventListener("keydown", handleGlobalF11);
+
+    return () => { 
+      clearTimeout(timer); 
+      clearTimeout(resumeTimer); 
+      window.removeEventListener("keydown", handleGlobalF11);
+    };
   }, []);
+
+  if (!onboarded) {
+    return (
+      <QueryClientProvider client={queryClient}>
+        <TooltipProvider>
+          <SplashScreen />
+          <Toaster />
+          <BrowserRouter>
+            <MainLayout>
+              <Onboarding onComplete={() => setOnboarded(true)} />
+            </MainLayout>
+          </BrowserRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+  }
 
   return (
     <QueryClientProvider client={queryClient}>
@@ -76,28 +212,24 @@ const App = () => {
         <SplashScreen />
         <Toaster />
         <BrowserRouter>
-          <ErrorBoundary>
-          <Routes>
-            <Route path="/" element={<Index />} />
-            <Route path="/browse" element={<Browse />} />
-            <Route path="/discover" element={<Discover />} />
-            <Route path="/discover/time" element={<TimeFilter />} />
-            <Route path="/discover/recommendations" element={<Recommendations />} />
-            <Route path="/discover/vibe" element={<VibeDetect />} />
-            <Route path="/discover/swipe" element={<SwipeMatch />} />
-            <Route path="/discover/keywords" element={<KeywordExplorer />} />
-            <Route path="/discover/hidden-gems" element={<HiddenGems />} />
-            <Route path="/search" element={<Search />} />
-            <Route path="/title/:id" element={<TitleDetail />} />
-            <Route path="/watchlist" element={<Watchlist />} />
-            <Route path="/downloads" element={<Downloads />} />
-            <Route path="/settings" element={<Settings />} />
-            <Route path="/social" element={<Social />} />
-            <Route path="/social/room/:roomId" element={<SocialRoom />} />
-            <Route path="/watch/:id" element={<Player />} />
-            <Route path="*" element={<NotFound />} />
-          </Routes>
-        </ErrorBoundary>
+          <MainLayout>
+            <ErrorBoundary>
+              <Routes>
+                <Route path="/" element={<Index />} />
+                <Route path="/browse" element={<Browse />} />
+                <Route path="/discover" element={<Discover />} />
+                <Route path="/search" element={<Search />} />
+                <Route path="/title/:id" element={<TitleDetail />} />
+                <Route path="/watchlist" element={<Watchlist />} />
+                <Route path="/downloads" element={<Downloads />} />
+                <Route path="/preview" element={<Preview />} />
+                <Route path="/onboarding" element={<Onboarding onComplete={() => setOnboarded(true)} />} />
+                <Route path="/settings" element={<Settings />} />
+                <Route path="/watch/:id" element={<Player />} />
+                <Route path="*" element={<NotFound />} />
+              </Routes>
+            </ErrorBoundary>
+          </MainLayout>
         </BrowserRouter>
 
         {/* Resume unfinished downloads dialog */}

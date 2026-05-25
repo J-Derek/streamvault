@@ -1,6 +1,7 @@
 import Navbar from "@/components/Navbar";
 import HeroSection from "@/components/HeroSection";
 import ContentRow from "@/components/ContentRow";
+import ResumeWatchingRow from "@/components/ResumeWatchingRow";
 import {
   getTrendingMovies,
   getNowPlaying,
@@ -15,6 +16,7 @@ const Index = () => {
       <Navbar />
       <HeroSection />
       <div className="relative z-10 -mt-16 space-y-12 pb-20">
+        <ResumeWatchingRow />
         <ContentRow label="Trending This Week" fetchFn={getTrendingMovies} mediaType="movie" />
         <ContentRow label="New Arrivals" fetchFn={getNowPlaying} mediaType="movie" />
         <ContentRow label="Top Rated" fetchFn={getTopRatedMovies} mediaType="movie" />

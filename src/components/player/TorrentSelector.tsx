@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Loader2, Zap, Wifi, Signal, PlayCircle, AlertCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useSettingsStore } from '@/store/settings';
 
 interface TorrentSelectorProps {
     imdbId: string;
@@ -20,6 +21,7 @@ export const TorrentSelector: React.FC<TorrentSelectorProps> = ({
     episode,
     onSelect
 }) => {
+    const { defaultQuality } = useSettingsStore();
     const [streams, setStreams] = useState<any[]>([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
@@ -34,9 +36,34 @@ export const TorrentSelector: React.FC<TorrentSelectorProps> = ({
             if (result.error) {
                 setError(result.error);
             } else {
+                const qualityScore = (stream: any): number => {
+                    const raw = (
+                        (stream.name ?? '') + ' ' + (stream.title ?? '')
+                    ).toLowerCase();
+                    const is4K   = raw.includes('2160') || raw.includes('4k');
+                    const is1080 = raw.includes('1080');
+                    const is720  = raw.includes('720');
+
+                    const streamQuality = is4K ? '4K' 
+                        : is1080 ? '1080p' 
+                        : is720 ? '720p' 
+                        : '480p';
+
+                    const boostMap: Record<string, Record<string, number>> = {
+                        '720p':  { '720p': 3000, '480p': 2000, '1080p': 1000, '4K': 500 },
+                        '1080p': { '1080p': 3000, '720p': 2000, '4K': 1500, '480p': 500 },
+                        '4K':    { '4K': 3000, '1080p': 2000, '720p': 1000, '480p': 500 },
+                    };
+
+                    return boostMap[defaultQuality]?.[streamQuality] ?? 0;
+                };
+
                 const normalized = (result.streams || [])
                     .map(normalizeTorrentioStream)
-                    .sort((a, b) => (b.rank - a.rank) || (b.seeds - a.seeds));
+                    .sort((a, b) =>
+                        (b.rank + qualityScore(b)) - (a.rank + qualityScore(a))
+                        || (b.seeds - a.seeds)
+                    );
                 setStreams(normalized);
             }
             setLoading(false);

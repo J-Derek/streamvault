@@ -55,6 +55,7 @@ function buildChips(params: URLSearchParams, genreMap: Record<number, string>) {
 }
 
 const BrowsePage = () => {
+    const navigate = useNavigate();
     const [params, setParams] = useSearchParams();
     const [view, setView] = useState<"grid" | "list">("grid");
     const [results, setResults] = useState<StreamVaultMedia[]>([]);
@@ -186,8 +187,6 @@ const BrowsePage = () => {
             })
         );
     }, []);
-
-    const navigate = useNavigate();
 
     return (
         <div className="min-h-screen bg-[#0D0D0D]">
@@ -361,7 +360,8 @@ const BrowsePage = () => {
                                 {results.map((media) => (
                                     <div
                                         key={media.id}
-                                        className="flex gap-4 p-4 rounded-lg bg-[#1C1C1E] border border-[#3A3A3C] hover:border-[#636366] transition-colors"
+                                        onClick={() => navigate(`/title/${media.id}?type=${media.mediaType ?? 'movie'}`)}
+                                        className="flex gap-4 p-4 rounded-lg bg-[#1C1C1E] border border-[#3A3A3C] hover:border-[#E50914]/50 transition-colors cursor-pointer active:scale-[0.99]"
                                     >
                                         <img
                                             src={`https://image.tmdb.org/t/p/w92${media.posterPath}`}

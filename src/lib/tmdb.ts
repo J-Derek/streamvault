@@ -136,6 +136,9 @@ export const searchMulti = (query: string, page = '1') =>
 export const searchMovies = (query: string) =>
     tmdbFetch<TMDBListResponse<TMDBMovie>>('/search/movie', { query });
 
+export const searchTVShows = (query: string) =>
+    tmdbFetch<TMDBListResponse<TMDBTVShow>>('/search/tv', { query });
+
 export const searchPeople = (query: string) =>
     tmdbFetch('/search/person', { query });
 
@@ -194,3 +197,21 @@ export const getLanguages = () =>
     tmdbFetch<Array<{ iso_639_1: string; english_name: string; name: string }>>(
         '/configuration/languages'
     );
+
+export const getTrending = (mediaType: 'movie' | 'tv' | 'all', timeWindow: 'day' | 'week', region?: string) => {
+    const params: Record<string, string> = {};
+    if (region && region !== 'global') {
+        params.region = region;
+    }
+    return tmdbFetch<TMDBListResponse<TMDBMovie | TMDBTVShow>>(`/trending/${mediaType}/${timeWindow}`, params);
+};
+
+export const getTrendingAllPaginated = (page = 1) =>
+    tmdbFetch<TMDBListResponse<TMDBMovie | TMDBTVShow>>('/trending/all/week', { page: String(page) });
+
+export const getVideos = (mediaType: 'movie' | 'tv', id: number) =>
+    tmdbFetch<{ results: Array<{ key: string; site: string; type: string; id: string }> }>(`/${mediaType}/${id}/videos`);
+
+export const searchKeywords = (query: string) =>
+    tmdbFetch<{ results: Array<{ id: number; name: string }> }>('/search/keyword', { query });
+

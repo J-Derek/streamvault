@@ -4,6 +4,7 @@ import { Server, ChevronRight, Play } from "lucide-react";
 import { normalizeTorrentioStream } from "@/lib/providers/torrentio";
 import { normalizeMedia, PROVIDERS } from "@/lib/tmdb-types";
 import { StreamRow } from "./StreamRow";
+import { useSettingsStore } from '@/store/settings';
 
 interface TorrentioStreamsProps {
     torrentData: any;
@@ -19,6 +20,7 @@ interface TorrentioStreamsProps {
 
 export const TorrentioStreams = ({ torrentData, isLoadingTorrents, numId, mediaType, title, selectedSeason, selectedEpisode, details, isTauri }: TorrentioStreamsProps) => {
     const navigate = useNavigate();
+    const { defaultQuality } = useSettingsStore();
 
     let streamsContent;
 
@@ -65,9 +67,21 @@ export const TorrentioStreams = ({ torrentData, isLoadingTorrents, numId, mediaT
 
                 const isTrustedProvider = provider.includes('piratebay') || provider.includes('yts') || provider.includes('1337x') || provider.includes('torrentgalaxy');
 
+                const qualityBoost: Record<string, Record<string, number>> = {
+                    '720p':  { '720p': 3000, '480p': 2000, '1080p': 1000, '4K': 500 },
+                    '1080p': { '1080p': 3000, '720p': 2000, '4K': 1500, '480p': 500 },
+                    '4K':    { '4K': 3000, '1080p': 2000, '720p': 1000, '480p': 500 },
+                };
+
+                const boosts = qualityBoost[defaultQuality] ?? qualityBoost['720p'];
+
+                const streamQuality = is4K ? '4K' 
+                    : is1080 ? '1080p' 
+                    : is720 ? '720p' 
+                    : '480p';
+
                 let customRank = norm.rank || 0;
-                if (is720) customRank += 2000;
-                if (is1080) customRank += 1000;
+                customRank += boosts[streamQuality] ?? 0;
                 if (isTrustedProvider) customRank += 5000;
                 customRank += seeds;
 

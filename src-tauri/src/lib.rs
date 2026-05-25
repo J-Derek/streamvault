@@ -221,6 +221,11 @@ impl TorrentState {
     }
 }
 
+#[derive(Default)]
+pub struct TempFilesState {
+    pub files: Mutex<Vec<String>>
+}
+
 async fn wait_for_engine(client: &Client) -> Result<(), String> {
     for _ in 0..15 {
         if let Ok(res) = client.get("http://127.0.0.1:3030/torrents").send().await {
@@ -273,6 +278,9 @@ async fn start_p2p_download(
     state: State<'_, TorrentState>,
     id: u32,
     magnet: String,
+    only_files_regex: Option<String>,
+    season: Option<u32>,
+    episode: Option<u32>,
 ) -> Result<(), String> {
     // 0. Wait for engine to be ready
     wait_for_engine(&state.client).await?;
@@ -284,7 +292,20 @@ async fn start_p2p_download(
         final_magnet.push_str("&tr=udp://tracker.opentrackr.org:1337/announce&tr=udp://opentracker.iise.re:6969/announce&tr=udp://9.rarbg.com:2810/announce&tr=udp://open.stealth.si:80/announce");
     }
 
-    let res = state.client.post("http://127.0.0.1:3030/torrents?is_url=true")
+    let mut resolved_regex = only_files_regex;
+    if let (Some(s), Some(ep)) = (season, episode) {
+        resolved_regex = Some(format!("(?i)(s{:02}e{:02}|{}x{:02})", s, ep, s, ep));
+    }
+
+    let mut url_str = "http://127.0.0.1:3030/torrents?is_url=true".to_string();
+    if let Some(ref regex) = resolved_regex {
+        if let Ok(mut parsed) = url::Url::parse(&url_str) {
+            parsed.query_pairs_mut().append_pair("only_files_regex", regex);
+            url_str = parsed.to_string();
+        }
+    }
+
+    let res = state.client.post(&url_str)
         .header("Content-Type", "text/plain")
         .body(final_magnet)
         .send().await.map_err(|e| format!("Failed to connect to P2P engine: {}", e))?;
@@ -303,20 +324,39 @@ async fn start_p2p_download(
     
     let info_hash = torrent_info_res.details.info_hash.clone();
     
-    // 1.5 Find largest file index
+    // 1.5 Find largest file index (or exact matched regex file for P2P streaming redirect)
     let mut file_index = 0;
     let details_url = format!("http://127.0.0.1:3030/torrents/{}", info_hash.to_lowercase());
     if let Ok(details_res) = state.client.get(&details_url).send().await {
         if let Ok(full_details) = details_res.json::<RqbitTorrent>().await {
             if let Some(files) = full_details.details.files {
                 let mut max_size = 0;
-                for (i, file) in files.iter().enumerate() {
-                    if file.length > max_size {
-                        max_size = file.length;
-                        file_index = i;
+                let mut matched_index = None;
+                
+                if let Some(ref regex_str) = resolved_regex {
+                    if let Ok(re) = regex::Regex::new(regex_str) {
+                        for (i, file) in files.iter().enumerate() {
+                            let name = file.components.join("/");
+                            if re.is_match(&name) {
+                                matched_index = Some(i);
+                                break;
+                            }
+                        }
                     }
                 }
-                log::info!("Selected largest file for {}: index {} ({} bytes)", info_hash, file_index, max_size);
+                
+                if let Some(idx) = matched_index {
+                    file_index = idx;
+                    log::info!("Selected matched regex file for {}: index {}", info_hash, file_index);
+                } else {
+                    for (i, file) in files.iter().enumerate() {
+                        if file.length > max_size {
+                            max_size = file.length;
+                            file_index = i;
+                        }
+                    }
+                    log::info!("Selected largest file for {}: index {} ({} bytes)", info_hash, file_index, max_size);
+                }
             }
         }
     }
@@ -489,6 +529,17 @@ fn download_torrent(url: String) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         std::process::Command::new("xdg-open").arg(&url).spawn().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn delete_file_by_path(
+    path: String,
+) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if p.exists() {
+        std::fs::remove_file(p).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -903,95 +954,364 @@ async fn kill_p2p_engine(state: tauri::State<'_, TorrentState>) -> Result<(), St
 }
 
 #[tauri::command]
-async fn open_in_external_player(app: AppHandle, id: u32, file_path: Option<String>) -> Result<(), String> {
-    let try_launch = |path: &str| -> bool {
-        if !std::path::Path::new(path).exists() { return false; }
-        let vlc_candidates: &[&str] = &[
-            "vlc",
-            r"C:\Program Files\VideoLAN\VLC\vlc.exe",
-            r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
-            r"C:\Program Files\VideoLAN\VLC\vlc.cmd",
-        ];
-        #[cfg(target_os = "windows")]
-        {
-            for vlc in vlc_candidates {
-                let p = std::path::PathBuf::from(vlc);
-                if p.exists() || (vlc == &"vlc" && std::process::Command::new("vlc").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).spawn().is_ok()) {
-                    if std::process::Command::new(if vlc == &"vlc" { "vlc" } else { vlc }).arg(path)
-                        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().is_ok() { return true; }
+async fn browse_custom_player() -> Result<Option<String>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let script = r#"
+            Add-Type -AssemblyName System.Windows.Forms;
+            $dialog = New-Object System.Windows.Forms.OpenFileDialog;
+            $dialog.Filter = "Executable Files (*.exe)|*.exe|All Files (*.*)|*.*";
+            $dialog.Title = "Select Custom Player Executable";
+            if ($dialog.ShowDialog() -eq "OK") {
+                Write-Output $dialog.FileName
+            }
+        "#;
+        
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-Command", script])
+            .output()
+            .map_err(|e| format!("Failed to open file dialog: {}", e))?;
+            
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        let script = r#"choose file of type {"app"} with prompt "Select Custom Player Application""#;
+        let output = Command::new("osascript")
+            .args(["-e", script])
+            .output()
+            .map_err(|e| format!("Failed to open file dialog: {}", e))?;
+            
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
+    }
+    
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(output) = Command::new("zenity")
+            .args(["--file-selection", "--title=Select Custom Player Executable"])
+            .output() {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Ok(Some(path));
                 }
             }
-            if std::process::Command::new("mpv").arg(path)
-                .stdout(Stdio::null()).stderr(Stdio::null()).spawn().is_ok() { return true; }
-            if std::process::Command::new("cmd").args(["/C", "start", "", &path])
-                .stdout(Stdio::null()).stderr(Stdio::null()).spawn().is_ok() { return true; }
         }
-        #[cfg(target_os = "macos")]
-        {
-            if std::process::Command::new("open").arg("-a").arg("VLC").arg(path).spawn().is_ok() { return true; }
-            if std::process::Command::new("open").arg("-a").arg("mpv").arg(path).spawn().is_ok() { return true; }
-            if std::process::Command::new("open").arg(path).spawn().is_ok() { return true; }
-        }
-        #[cfg(target_os = "linux")]
-        {
-            if std::process::Command::new("vlc").arg(path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().is_ok() { return true; }
-            if std::process::Command::new("mpv").arg(path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().is_ok() { return true; }
-            if std::process::Command::new("xdg-open").arg(path).spawn().is_ok() { return true; }
-        }
-        false
-    };
+        Ok(None)
+    }
+}
 
+fn find_vlc() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut paths = vec![
+            r"C:\Program Files\VideoLAN\VLC\vlc.exe".to_string(),
+            r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe".to_string(),
+        ];
+        if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+            paths.push(format!(r"{}\Programs\VLC\vlc.exe", local_appdata));
+        }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            paths.push(format!(r"{}\Local\Programs\VLC\vlc.exe", appdata));
+        }
+        if let Ok(userprofile) = std::env::var("USERPROFILE") {
+            paths.push(format!(r"{}\AppData\Local\Programs\VLC\vlc.exe", userprofile));
+        }
+        for p in &paths {
+            if std::path::Path::new(p).exists() {
+                return Some(p.to_string());
+            }
+        }
+        if Command::new("vlc").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).spawn().is_ok() {
+            return Some("vlc".to_string());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let paths = [
+            "/Applications/VLC.app/Contents/MacOS/VLC",
+            "/Applications/VLC.app/Contents/MacOS/vlc",
+        ];
+        for p in &paths {
+            if std::path::Path::new(p).exists() {
+                return Some(p.to_string());
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if Command::new("vlc").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).spawn().is_ok() {
+            return Some("vlc".to_string());
+        }
+    }
+    None
+}
+
+fn find_mpv() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut paths = vec![
+            r"C:\Program Files\mpv\mpv.exe".to_string(),
+            r"C:\mpv\mpv.exe".to_string(),
+        ];
+        if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+            paths.push(format!(r"{}\Programs\mpv\mpv.exe", local_appdata));
+        }
+        if let Ok(userprofile) = std::env::var("USERPROFILE") {
+            paths.push(format!(r"{}\AppData\Local\Programs\mpv\mpv.exe", userprofile));
+        }
+        for p in &paths {
+            if std::path::Path::new(p).exists() {
+                return Some(p.to_string());
+            }
+        }
+        if Command::new("mpv").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).spawn().is_ok() {
+            return Some("mpv".to_string());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let paths = [
+            "/Applications/mpv.app/Contents/MacOS/mpv",
+        ];
+        for p in &paths {
+            if std::path::Path::new(p).exists() {
+                return Some(p.to_string());
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if Command::new("mpv").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).spawn().is_ok() {
+            return Some("mpv".to_string());
+        }
+    }
+    None
+}
+
+#[tauri::command]
+async fn open_in_external_player(
+    app: AppHandle,
+    id: u32,
+    file_path: Option<String>,
+    player_path: Option<String>,
+) -> Result<(), String> {
     let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
-
-    // 0. If frontend passed a direct file_path, use it first (most reliable)
+    
+    // Resolve file path
+    let mut resolved_path = None;
     if let Some(ref fp) = file_path {
-        if try_launch(fp) { return Ok(()); }
-    }
-
-    // 1. Database lookup (single source of truth)
-    let ts = app.state::<TorrentState>();
-    if let Ok(record) = ts.download_db.get(id as i64) {
-        if let Some(r) = record {
-            if try_launch(&r.file_path) { return Ok(()); }
+        if std::path::Path::new(fp).exists() {
+            resolved_path = Some(fp.clone());
         }
     }
-
-    // 2. Search for the largest video file across both directories
-    let search_dirs = [app_data.join("p2p_cache"), get_streamvault_dir(&app)];
-    for dir in &search_dirs {
-        if !dir.exists() { continue; }
-        fn walk_videos(dir: &std::path::Path) -> Option<String> {
-            let mut best = String::new();
-            let mut best_size: u64 = 0;
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        if let Some(found) = walk_videos(&path) {
-                            if let Ok(meta) = std::fs::metadata(&found) {
-                                if meta.len() > best_size { best_size = meta.len(); best = found; }
+    
+    if resolved_path.is_none() {
+        let ts = app.state::<TorrentState>();
+        if let Ok(Some(record)) = ts.download_db.get(id as i64) {
+            if std::path::Path::new(&record.file_path).exists() {
+                resolved_path = Some(record.file_path);
+            }
+        }
+    }
+    
+    if resolved_path.is_none() {
+        let search_dirs = [app_data.join("p2p_cache"), get_streamvault_dir(&app)];
+        for dir in &search_dirs {
+            if !dir.exists() { continue; }
+            fn walk_videos(dir: &std::path::Path) -> Option<String> {
+                let mut best = String::new();
+                let mut best_size: u64 = 0;
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            if let Some(found) = walk_videos(&path) {
+                                if let Ok(meta) = std::fs::metadata(&found) {
+                                    if meta.len() > best_size { best_size = meta.len(); best = found; }
+                                }
                             }
-                        }
-                    } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        if matches!(ext.to_lowercase().as_str(), "mp4" | "mkv" | "avi" | "webm" | "m4v" | "mov" | "mpg" | "mpeg" | "ts") {
-                            if let Ok(meta) = std::fs::metadata(&path) {
-                                if meta.len() > best_size { best_size = meta.len(); best = path.to_string_lossy().to_string(); }
+                        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                            if matches!(ext.to_lowercase().as_str(), "mp4" | "mkv" | "avi" | "webm" | "m4v" | "mov" | "mpg" | "mpeg" | "ts") {
+                                if let Ok(meta) = std::fs::metadata(&path) {
+                                    if meta.len() > best_size { best_size = meta.len(); best = path.to_string_lossy().to_string(); }
+                                }
                             }
                         }
                     }
                 }
+                if best.is_empty() { None } else { Some(best) }
             }
-            if best.is_empty() { None } else { Some(best) }
-        }
-        if let Some(found) = walk_videos(dir) {
-            if try_launch(&found) { return Ok(()); }
+            if let Some(found) = walk_videos(dir) {
+                resolved_path = Some(found);
+                break;
+            }
         }
     }
+    
+    let path_to_open = resolved_path.ok_or_else(|| "Could not find the downloaded file on disk.".to_string())?;
 
-    // 3. Final fallback: Return error to UI instead of opening browser
-    Err("Could not find the downloaded file on disk. It may have been moved or deleted.".to_string())
+    // Determine target player
+    let player_str = player_path.unwrap_or_else(|| "default".to_string());
+    
+    #[cfg(target_os = "windows")]
+    {
+        match player_str.as_str() {
+            "default" | "" | "System Default" => {
+                let status = Command::new("explorer")
+                    .arg(&path_to_open)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                
+                if status.is_err() || !status.unwrap().success() {
+                    Command::new("rundll32")
+                        .args(["url.dll,FileProtocolHandler", &path_to_open])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .map_err(|e| format!("Failed to open default player: {}", e))?;
+                }
+            },
+            "vlc" | "VLC" => {
+                if let Some(vlc_bin) = find_vlc() {
+                    Command::new(&vlc_bin)
+                        .arg(&path_to_open)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .map_err(|e| format!("Failed to launch VLC: {}", e))?;
+                } else {
+                    return Err("VLC is not installed or could not be found. Please install VLC or select System Default.".to_string());
+                }
+            },
+            "mpv" | "MPV" => {
+                if let Some(mpv_bin) = find_mpv() {
+                    Command::new(&mpv_bin)
+                        .arg(&path_to_open)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .map_err(|e| format!("Failed to launch MPV: {}", e))?;
+                } else {
+                    return Err("MPV is not installed or could not be found. Please select VLC, System Default, or select a custom path.".to_string());
+                }
+            },
+            custom_path => {
+                if std::path::Path::new(custom_path).exists() {
+                    Command::new(custom_path)
+                        .arg(&path_to_open)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .map_err(|e| format!("Failed to launch custom player: {}", e))?;
+                } else {
+                    return Err(format!("The custom player executable path does not exist: {}", custom_path));
+                }
+            }
+        }
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = Command::new("open");
+        match player_str.as_str() {
+            "default" | "" | "System Default" => {
+                cmd.arg(&path_to_open);
+            },
+            "vlc" | "VLC" => {
+                cmd.args(["-a", "VLC", &path_to_open]);
+            },
+            "mpv" | "MPV" => {
+                cmd.args(["-a", "mpv", &path_to_open]);
+            },
+            custom_path => {
+                cmd.args(["-a", custom_path, &path_to_open]);
+            }
+        }
+        cmd.stdout(Stdio::null())
+           .stderr(Stdio::null())
+           .spawn()
+           .map_err(|e| format!("Failed to open file on Mac: {}", e))?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        match player_str.as_str() {
+            "default" | "" | "System Default" => {
+                Command::new("xdg-open").arg(&path_to_open)
+                    .stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+                    .map_err(|e| format!("Failed to xdg-open: {}", e))?;
+            },
+            "vlc" | "VLC" => {
+                Command::new("vlc").arg(&path_to_open)
+                    .stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+                    .map_err(|e| format!("Failed to spawn vlc: {}", e))?;
+            },
+            "mpv" | "MPV" => {
+                Command::new("mpv").arg(&path_to_open)
+                    .stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+                    .map_err(|e| format!("Failed to spawn mpv: {}", e))?;
+            },
+            custom_path => {
+                Command::new(custom_path).arg(&path_to_open)
+                    .stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+                    .map_err(|e| format!("Failed to spawn custom player: {}", e))?;
+            }
+        }
+    }
+    
+    Ok(())
 }
 
+
+fn match_rust_file_to_episode(name: &str, season: u32, episode: u32) -> bool {
+    let name_lower = name.to_lowercase();
+    
+    // Check standard patterns
+    let patterns = vec![
+        format!("s{:02}e{:02}", season, episode),
+        format!("s{}e{}", season, episode),
+        format!("s{:02}e{}", season, episode),
+        format!("s{}e{:02}", season, episode),
+        format!("{}x{:02}", season, episode),
+        format!("{}x{}", season, episode),
+    ];
+    
+    for pat in patterns {
+        if name_lower.contains(&pat) {
+            return true;
+        }
+    }
+    
+    // Regexp fallback for more complex separators
+    let regex_patterns = vec![
+        format!(r"(?i)\bs0*{}\s*x\s*0*{}\b", season, episode),
+        format!(r"(?i)\bs0*{}\s*e\s*0*{}\b", season, episode),
+    ];
+    for pat in regex_patterns {
+        if let Ok(re) = regex::Regex::new(&pat) {
+            if re.is_match(&name_lower) {
+                return true;
+            }
+        }
+    }
+    
+    false
+}
 
 #[tauri::command]
 async fn sync_download_path(
@@ -999,6 +1319,8 @@ async fn sync_download_path(
     state: tauri::State<'_, TorrentState>,
     id: u32,
     info_hash: String,
+    season: Option<u32>,
+    episode: Option<u32>,
 ) -> Result<String, String> {
     let details_url = format!("http://127.0.0.1:3030/torrents/{}", info_hash.to_lowercase());
     let mut file_path = String::new();
@@ -1009,33 +1331,61 @@ async fn sync_download_path(
             let details = full_details.get("details").unwrap_or(&full_details);
             
             if let Some(files) = details.get("files").and_then(|f| f.as_array()) {
-                let mut max_size = 0u64;
-                for file in files {
-                    let length = file.get("length").and_then(|l| l.as_u64()).unwrap_or(0);
-                    if length > max_size {
-                        max_size = length;
-                        let mut path_buf = get_streamvault_dir(&app);
-                        if let Some(name) = details.get("name").and_then(|n| n.as_str()) {
-                            let comps = file.get("components").and_then(|c| c.as_array());
-                            if let Some(comps) = comps {
-                                let first = comps.first().and_then(|c| c.as_str()).unwrap_or("");
-                                if name != first || comps.len() > 1 {
-                                    path_buf = path_buf.join(name);
-                                }
-                            } else {
+                let mut selected_file = None;
+                
+                // If season and episode are specified, try to match
+                if let (Some(s), Some(ep)) = (season, episode) {
+                    for file in files {
+                        let comps = file.get("components").and_then(|c| c.as_array());
+                        let name = if let Some(comps) = comps {
+                            comps.iter().filter_map(|c| c.as_str()).collect::<Vec<_>>().join("/")
+                        } else {
+                            String::new()
+                        };
+                        
+                        if match_rust_file_to_episode(&name, s, ep) {
+                            selected_file = Some((file.clone(), file.get("length").and_then(|l| l.as_u64()).unwrap_or(0)));
+                            break;
+                        }
+                    }
+                }
+                
+                // Fallback to largest file if no match found
+                if selected_file.is_none() {
+                    let mut max_size = 0u64;
+                    let mut best_file = None;
+                    for file in files {
+                        let length = file.get("length").and_then(|l| l.as_u64()).unwrap_or(0);
+                        if length > max_size {
+                            max_size = length;
+                            best_file = Some((file.clone(), length));
+                        }
+                    }
+                    selected_file = best_file;
+                }
+
+                if let Some((file, length)) = selected_file {
+                    let mut path_buf = get_streamvault_dir(&app);
+                    if let Some(name) = details.get("name").and_then(|n| n.as_str()) {
+                        let comps = file.get("components").and_then(|c| c.as_array());
+                        if let Some(comps) = comps {
+                            let first = comps.first().and_then(|c| c.as_str()).unwrap_or("");
+                            if name != first || comps.len() > 1 {
                                 path_buf = path_buf.join(name);
                             }
+                        } else {
+                            path_buf = path_buf.join(name);
                         }
-                        if let Some(comps) = file.get("components").and_then(|c| c.as_array()) {
-                            for comp in comps {
-                                if let Some(comp_str) = comp.as_str() {
-                                    path_buf = path_buf.join(comp_str);
-                                }
+                    }
+                    if let Some(comps) = file.get("components").and_then(|c| c.as_array()) {
+                        for comp in comps {
+                            if let Some(comp_str) = comp.as_str() {
+                                path_buf = path_buf.join(comp_str);
                             }
                         }
-                        file_path = path_buf.to_string_lossy().to_string();
-                        file_size = Some(max_size as i64);
                     }
+                    file_path = path_buf.to_string_lossy().to_string();
+                    file_size = Some(length as i64);
                 }
             }
         }
@@ -1190,6 +1540,9 @@ pub struct ScannedFile {
     pub parsed_title: String,
     pub parsed_year: Option<i32>,
     pub file_size: u64,
+    pub media_type: String,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
 }
 
 #[tauri::command]
@@ -1200,7 +1553,7 @@ async fn scan_local_library(app: tauri::AppHandle) -> Result<Vec<ScannedFile>, S
         return Ok(vec![]);
     }
 
-    let video_extensions = ["mp4", "mkv", "avi", "webm"];
+    let video_extensions = ["mp4", "mkv", "avi", "webm", "svd"];
     let mut results: Vec<ScannedFile> = Vec::new();
 
     // Regex to strip torrent tags and extract title + year
@@ -1211,11 +1564,15 @@ async fn scan_local_library(app: tauri::AppHandle) -> Result<Vec<ScannedFile>, S
     let year_regex = regex::Regex::new(r"(19|20)\d{2}")
         .map_err(|e| e.to_string())?;
 
+    let tv_regex = regex::Regex::new(r"(?i)[Ss](\d{1,2})[Ee](\d{1,2})")
+        .map_err(|e| e.to_string())?;
+
     fn walk_dir(
         dir: &std::path::Path,
         video_extensions: &[&str],
         tag_regex: &regex::Regex,
         year_regex: &regex::Regex,
+        tv_regex: &regex::Regex,
         results: &mut Vec<ScannedFile>,
     ) {
         let entries = match std::fs::read_dir(dir) {
@@ -1227,7 +1584,7 @@ async fn scan_local_library(app: tauri::AppHandle) -> Result<Vec<ScannedFile>, S
             let path = entry.path();
 
             if path.is_dir() {
-                walk_dir(&path, video_extensions, tag_regex, year_regex, results);
+                walk_dir(&path, video_extensions, tag_regex, year_regex, tv_regex, results);
                 continue;
             }
 
@@ -1248,16 +1605,36 @@ async fn scan_local_library(app: tauri::AppHandle) -> Result<Vec<ScannedFile>, S
                     .unwrap_or("")
                     .to_string();
 
-                let raw_name = if stem.len() < 5 || stem.chars().all(|c| c.is_alphanumeric()) {
-                    // Looks like a hash, use parent folder name instead
-                    path.parent()
+                let mut raw_name = if stem.len() < 5 || stem.chars().all(|c| c.is_alphanumeric()) {
+                    // Looks like a hash or episode code (e.g. S01E01), prepend parent folder name
+                    let parent = path.parent()
                         .and_then(|p| p.file_name())
                         .and_then(|n| n.to_str())
-                        .unwrap_or(&stem)
-                        .to_string()
+                        .unwrap_or("");
+                    format!("{} {}", parent, stem)
                 } else {
                     stem.replace('.', " ").replace('_', " ")
                 };
+
+                let mut media_type = "movie".to_string();
+                let mut season: Option<u32> = None;
+                let mut episode: Option<u32> = None;
+
+                if let Some(captures) = tv_regex.captures(&raw_name.clone()) {
+                    media_type = "tv".to_string();
+                    season = captures.get(1).and_then(|m| m.as_str().parse::<u32>().ok());
+                    episode = captures.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
+                    
+                    if let Some(m) = captures.get(0) {
+                        let title_part = raw_name[..m.start()].trim();
+                        if !title_part.is_empty() {
+                            // Extract only the part before S01E01 (the show name)
+                            raw_name = title_part.to_string();
+                        } else {
+                            raw_name = tv_regex.replace(&raw_name, " ").to_string();
+                        }
+                    }
+                }
 
                 // Extract year before stripping tags
                 let parsed_year = year_regex.find(&raw_name)
@@ -1287,12 +1664,15 @@ async fn scan_local_library(app: tauri::AppHandle) -> Result<Vec<ScannedFile>, S
                     parsed_title,
                     parsed_year,
                     file_size,
+                    media_type,
+                    season,
+                    episode,
                 });
             }
         }
     }
 
-    walk_dir(&streamvault_dir, &video_extensions, &tag_regex, &year_regex, &mut results);
+    walk_dir(&streamvault_dir, &video_extensions, &tag_regex, &year_regex, &tv_regex, &mut results);
 
     Ok(results)
 }
@@ -1328,6 +1708,9 @@ pub fn run() {
     .plugin(tauri_plugin_log::Builder::default().build())
     .plugin(tauri_plugin_fs::init())
     .setup(|app| {
+      use tauri::Manager;
+      app.manage(TempFilesState::default());
+      println!("=== SETUP STARTED ===");
       #[cfg(target_os = "windows")]
       {
           let _ = std::process::Command::new("taskkill")
@@ -1385,20 +1768,25 @@ pub fn run() {
 
       let app_handle_for_server = app.handle().clone();
       thread::spawn(move || {
-          let server = Server::http("127.0.0.1:8083").unwrap();
-          for mut request in server.incoming_requests() {
-              let url = request.url().to_string();
-              
-              // Handle OPTIONS requests (CORS preflight) site-wide
-              if request.method() == &tiny_http::Method::Options {
-                  let res = TinyResponse::empty(204)
-                      .with_header(Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
-                      .with_header(Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET, POST, OPTIONS, DELETE"[..]).unwrap())
-                      .with_header(Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type, Range"[..]).unwrap())
-                      .with_header(Header::from_bytes(&b"Access-Control-Max-Age"[..], &b"86400"[..]).unwrap());
-                  let _ = request.respond(res);
-                  continue;
-              }
+          println!("=== PROXY THREAD STARTED ===");
+          log::info!("Starting proxy server on 127.0.0.1:8083...");
+          match Server::http("127.0.0.1:8083") {
+              Ok(server) => {
+                  println!("=== PROXY BOUND SUCESSFULLY ===");
+                  log::info!("Proxy server bound successfully to 127.0.0.1:8083");
+                  for mut request in server.incoming_requests() {
+                      let url = request.url().to_string();
+                      
+                      // Handle OPTIONS requests (CORS preflight) site-wide
+                      if request.method() == &tiny_http::Method::Options {
+                          let res = TinyResponse::empty(204)
+                              .with_header(Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
+                              .with_header(Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET, POST, OPTIONS, DELETE"[..]).unwrap())
+                              .with_header(Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type, Range"[..]).unwrap())
+                              .with_header(Header::from_bytes(&b"Access-Control-Max-Age"[..], &b"86400"[..]).unwrap());
+                          let _ = request.respond(res);
+                          continue;
+                      }
 
               if url.starts_with("/offline/") {
                   let id_str = url.trim_start_matches("/offline/").split('?').next().unwrap_or("");
@@ -1550,28 +1938,48 @@ pub fn run() {
                       let content_length = end.saturating_sub(start) + 1;
                       
                       let status_code = if is_partial { 206 } else { 200 };
-                      let mut response = TinyResponse::new(
-                          tiny_http::StatusCode(status_code),
-                          vec![
-                              Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()).unwrap(),
-                              Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap(),
-                              Header::from_bytes(&b"Accept-Ranges"[..], &b"bytes"[..]).unwrap(),
-                          ],
-                          file,
-                          Some(content_length as usize),
-                          None,
-                      );
+                      let headers = vec![
+                          Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()).unwrap(),
+                          Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap(),
+                          Header::from_bytes(&b"Accept-Ranges"[..], &b"bytes"[..]).unwrap(),
+                      ];
                       
-                      if is_partial {
-                          response.add_header(
-                              Header::from_bytes(
-                                  &b"Content-Range"[..],
-                                  format!("bytes {}-{}/{}", start, end, file_size).as_bytes()
-                              ).unwrap()
+                      if file_path.to_string_lossy().to_lowercase().ends_with(".svd") {
+                          let mut response = TinyResponse::new(
+                              tiny_http::StatusCode(status_code),
+                              headers,
+                              XorReader { file, offset: start },
+                              Some(content_length as usize),
+                              None,
                           );
+                          if is_partial {
+                              response.add_header(
+                                  Header::from_bytes(
+                                      &b"Content-Range"[..],
+                                      format!("bytes {}-{}/{}", start, end, file_size).as_bytes()
+                                  ).unwrap()
+                              );
+                          }
+                          let _ = request.respond(response);
+                      } else {
+                          let mut response = TinyResponse::new(
+                              tiny_http::StatusCode(status_code),
+                              headers,
+                              file,
+                              Some(content_length as usize),
+                              None,
+                          );
+                          if is_partial {
+                              response.add_header(
+                                  Header::from_bytes(
+                                      &b"Content-Range"[..],
+                                      format!("bytes {}-{}/{}", start, end, file_size).as_bytes()
+                                  ).unwrap()
+                              );
+                          }
+                          let _ = request.respond(response);
                       }
                       
-                      let _ = request.respond(response);
                       continue;
                   }
 
@@ -1620,12 +2028,20 @@ pub fn run() {
               }
               let _ = request.respond(TinyResponse::from_string("StreamVault Native Proxy Active"));
           }
+          },
+          Err(e) => {
+              std::fs::write("proxy_debug.log", format!("Failed to bind proxy server: {}\n", e)).unwrap_or_default();
+              log::error!("Failed to bind proxy server: {}", e);
+          }
+      }
       });
       Ok(())
     })
     .invoke_handler(tauri::generate_handler![
       open_in_external_player,
+      browse_custom_player,
       delete_media_file,
+      delete_file_by_path,
       download_media,
       download_torrent,
       start_p2p_download,
@@ -1644,20 +2060,150 @@ pub fn run() {
             get_playable_url,
       db_list_downloads,
       db_remove_download,
-      scan_local_library
+      scan_local_library,
+      remux_to_mp4,
+      find_subtitle_files
     ])
     .build(tauri::generate_context!())
     .expect("error while building tauri application");
 
   app.run(move |app_handle, event| {
     if let tauri::RunEvent::Exit = event {
-        let state = app_handle.state::<TorrentState>();
-        let mut process_guard = state.sidecar_process.lock().unwrap();
-        if let Some(mut child) = process_guard.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-            log::info!("Sidecar process terminated successfully on app exit.");
+        if let Some(state) = app_handle.try_state::<TorrentState>() {
+            if let Ok(mut process_guard) = state.sidecar_process.lock() {
+                if let Some(mut child) = process_guard.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    log::info!("Sidecar process terminated successfully on app exit.");
+                }
+            }
+        }
+        if let Some(temp_state) = app_handle.try_state::<TempFilesState>() {
+            if let Ok(temps) = temp_state.files.lock() {
+                for file in temps.iter() {
+                    let _ = std::fs::remove_file(file);
+                }
+            }
         }
     }
   });
+}
+
+#[tauri::command]
+async fn remux_to_mp4(app: AppHandle, file_path: String) -> Result<String, String> {
+    let temp_dir = std::env::temp_dir();
+    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    let temp_file = temp_dir.join(format!("streamvault_remux_{}.mp4", timestamp));
+    let temp_file_str = temp_file.to_string_lossy().to_string();
+
+    let target_triple = app.env().args_os.get(0).and_then(|_| Some("x86_64-pc-windows-msvc")).unwrap_or("x86_64-pc-windows-msvc");
+    
+    let bin_dir_resource = app.path().resource_dir().map_err(|e| e.to_string())?.join("bin");
+    let app_config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    let bin_dir_dev = if let Some(parent) = app_config_dir.parent() {
+        parent.join("src-tauri/bin")
+    } else {
+        bin_dir_resource.clone()
+    };
+    
+    let mut sidecar_path = bin_dir_resource.join(format!("ffmpeg-{}.exe", target_triple));
+    if !sidecar_path.exists() {
+        let dev_path = bin_dir_dev.join(format!("ffmpeg-{}.exe", target_triple));
+        if dev_path.exists() {
+            sidecar_path = dev_path;
+        } else {
+            // Also check for just "ffmpeg.exe" as fallback
+            let fallback_path = bin_dir_resource.join("ffmpeg.exe");
+            if fallback_path.exists() {
+                sidecar_path = fallback_path;
+            } else {
+                let fallback_dev = bin_dir_dev.join("ffmpeg.exe");
+                if fallback_dev.exists() {
+                    sidecar_path = fallback_dev;
+                }
+            }
+        }
+    }
+
+    let mut child = Command::new(sidecar_path)
+        .args([
+            "-y",
+            "-i", &file_path,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-movflags", "faststart",
+            &temp_file_str,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn().map_err(|e| format!("Failed to spawn ffmpeg: {}", e))?;
+
+    let start_time = std::time::Instant::now();
+    let mut finished = false;
+    let mut exit_status = None;
+
+    while start_time.elapsed() < std::time::Duration::from_secs(30) {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_status = Some(status);
+                finished = true;
+                break;
+            }
+            Ok(None) => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(format!("Error waiting for ffmpeg: {}", e));
+            }
+        }
+    }
+
+    if !finished {
+        let _ = child.kill();
+        let _ = child.wait(); // Clean up zombie process
+        return Err("ffmpeg remuxing timed out after 30 seconds".into());
+    }
+
+    let status = exit_status.ok_or_else(|| "Failed to get ffmpeg status".to_string())?;
+    if !status.success() {
+        return Err("ffmpeg failed to remux".into());
+    }
+
+    let state = app.state::<TempFilesState>();
+    let mut temps = state.files.lock().unwrap();
+    temps.push(temp_file_str.clone());
+
+    Ok(temp_file_str)
+}
+
+#[tauri::command]
+fn find_subtitle_files(file_path: String) -> Result<Vec<String>, String> {
+    let path = std::path::Path::new(&file_path);
+    let mut subtitles = Vec::new();
+    
+    if let (Some(parent), Some(stem)) = (path.parent(), path.file_stem()) {
+        let stem_str = stem.to_string_lossy().to_string();
+        
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let entry_path = entry.path();
+                if entry_path.is_file() {
+                    if let Some(ext) = entry_path.extension() {
+                        let ext_str = ext.to_string_lossy().to_lowercase();
+                        if ext_str == "srt" || ext_str == "vtt" {
+                            if let Some(entry_stem) = entry_path.file_stem() {
+                                let entry_stem_str = entry_stem.to_string_lossy().to_string();
+                                if entry_stem_str.starts_with(&stem_str) {
+                                    subtitles.push(entry_path.to_string_lossy().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(subtitles)
 }

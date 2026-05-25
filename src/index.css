@@ -93,3 +93,11 @@
     display: none;
   }
 }
+
+/* Bulletproof Fullscreen Layout Overrides */
+body.is-fullscreen #titlebar {
+  display: none !important;
+}
+body.is-fullscreen [data-layout-padding] {
+  padding-top: 0 !important;
+}

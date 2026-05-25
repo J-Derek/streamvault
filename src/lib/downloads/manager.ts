@@ -2,6 +2,51 @@ import { useDownloadStore, type DownloadStatus } from "@/store/downloads";
 export { useDownloadStore };
 import { saveToDisk } from "@/lib/persistence";
 import type { StreamVaultMedia } from "@/lib/tmdb-types";
+import { matchFileToEpisode } from "@/lib/downloads/utils";
+import { useSettingsStore } from "@/store/settings";
+
+const qualityBoost: Record<string, Record<string, number>> = {
+    '720p':  { '720p': 3000, '480p': 2000, '1080p': 1000, '4K': 500 },
+    '1080p': { '1080p': 3000, '720p': 2000, '4K': 1500, '480p': 500 },
+    '4K':    { '4K': 3000, '1080p': 2000, '720p': 1000, '480p': 500 },
+};
+
+export const pickBestTorrentioStream = (streams: any[], defaultQuality: string): any => {
+    if (!streams || streams.length === 0) return null;
+
+    const ranked = streams.map((s) => {
+        const rawName = ((s.name ?? '') + ' ' + (s.title ?? '')).toLowerCase();
+        const is4K = rawName.includes('2160') || rawName.includes('4k');
+        const is1080 = rawName.includes('1080');
+        const is720 = rawName.includes('720');
+
+        const titleLines = (s.title ?? '').split('\n');
+        const statsLine = titleLines.find((l: string) => l.includes('👤') || l.includes('💾') || l.includes('⚙')) || (titleLines[1] ?? '');
+
+        const seedsMatch = statsLine.match(/(?:👤)\s*(\d+)/u);
+        const seeds = seedsMatch ? parseInt(seedsMatch[1], 10) : (s.seeders ?? 0);
+
+        const providerMatch = statsLine.match(/(?:⚙️?)\s*([^\n👤💾⚙]+)/u);
+        const provider = providerMatch ? providerMatch[1].trim().toLowerCase() : '';
+        const isTrustedProvider = provider.includes('piratebay') || provider.includes('yts') || provider.includes('1337x') || provider.includes('torrentgalaxy');
+
+        const boosts = qualityBoost[defaultQuality] ?? qualityBoost['720p'];
+        const streamQuality = is4K ? '4K'
+            : is1080 ? '1080p'
+            : is720 ? '720p'
+            : '480p';
+
+        let customRank = s.rank || 0;
+        customRank += boosts[streamQuality] ?? 0;
+        if (isTrustedProvider) customRank += 5000;
+        customRank += seeds;
+
+        return { stream: s, customRank };
+    });
+
+    ranked.sort((a, b) => b.customRank - a.customRank);
+    return ranked[0].stream;
+};
 
 // Helper for platform detection
 const isTauri = !!(
@@ -10,6 +55,229 @@ const isTauri = !!(
 );
 
 const P2P_BASE = "http://127.0.0.1:8083/p2p-proxy";
+
+const setSeasonPackPriorities = async (
+    infoHash: string,
+    selectedEpisodes: { season: number; episode: number }[]
+): Promise<void> => {
+    const P2P_BASE = 'http://127.0.0.1:3030';
+    console.log(`[SeasonPack] Starting rapid priority configuration for ${infoHash}`);
+
+    let files: any[] = [];
+    // Poll immediately and rapidly every 400ms up to 30 times (12s total) to detect metadata resolution as early as possible
+    for (let attempt = 1; attempt <= 30; attempt++) {
+        try {
+            const res = await fetch(`${P2P_BASE}/torrents/${infoHash}/files`);
+            if (res.ok) {
+                const data = await res.json();
+                if (data && data.length > 0) {
+                    files = data;
+                    console.log(`[SeasonPack] Metadata resolved on attempt ${attempt} (${attempt * 400}ms)`);
+                    break;
+                }
+            }
+        } catch (e) {
+            // Silence errors during rapid resolution polling
+        }
+        await new Promise(r => setTimeout(r, 400));
+    }
+
+    if (files.length === 0) {
+        console.error(`[SeasonPack] Failed to fetch file list for infoHash ${infoHash} after rapid polling`);
+        return;
+    }
+
+    // Enforce disable-all-then-enable-selected pattern
+    const priorities: Record<number, { priority: string }> = {};
+    for (let i = 0; i < files.length; i++) {
+        priorities[i] = { priority: 'skip' };
+    }
+
+    // Now enable only the selected episodes
+    for (const ep of selectedEpisodes) {
+        const fileIndex = files.findIndex(f =>
+            matchFileToEpisode(f.name || f.path || "", ep.season, ep.episode)
+        );
+        if (fileIndex !== -1) {
+            priorities[fileIndex] = { priority: 'normal' };
+            console.log(`[SeasonPack] Enabled file [${fileIndex}] for S${ep.season}E${ep.episode}`);
+        } else {
+            console.warn(`[SeasonPack] Could not match file for S${ep.season}E${ep.episode}`);
+        }
+    }
+
+    try {
+        const res = await fetch(`${P2P_BASE}/torrents/${infoHash}/files`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(priorities)
+        });
+        if (res.ok) {
+            console.log(`[SeasonPack] Successfully applied priorities to rqbit for ${infoHash}`);
+        } else {
+            console.error(`[SeasonPack] Failed to POST priorities to rqbit: status ${res.status}`);
+        }
+    } catch (e) {
+        console.error(`[SeasonPack] Error configuring priorities:`, e);
+    }
+};
+
+
+const triggerActualDownload = async (taskKey: string, task: any) => {
+    const store = useDownloadStore.getState();
+    const media = task.media;
+    const infoHash = task.infoHash;
+    const magnetUrl = task.magnetUrl;
+    const streamUrl = task.streamUrl || magnetUrl;
+
+    const isEpisode = taskKey.includes(':s');
+    const showId = media.id;
+
+    console.log(`[QueueManager] Promoting task ${taskKey} to downloading. Media:`, media.title);
+
+    if (isTauri) {
+        try {
+            const { invoke } = await import("@tauri-apps/api/core");
+
+            if (magnetUrl || (streamUrl && streamUrl.startsWith('magnet:'))) {
+                const finalMagnet = magnetUrl || streamUrl!;
+                
+                // Spawn engine if not already running
+                if (!store.p2pEngineReady) {
+                    try { await invoke("spawn_p2p_engine"); } catch { /* already running */ }
+                    await new Promise(r => setTimeout(r, 1500)); // give engine a moment to bind
+                }
+
+                let seasonNum: number | undefined;
+                let episodeNum: number | undefined;
+                if (isEpisode) {
+                    const match = taskKey.match(/:s(\d+)e(\d+)/i);
+                    if (match) {
+                        seasonNum = parseInt(match[1], 10);
+                        episodeNum = parseInt(match[2], 10);
+                    }
+                }
+
+                await invoke("start_p2p_download", {
+                    id: showId,
+                    magnet: finalMagnet,
+                    season: seasonNum,
+                    episode: episodeNum
+                });
+
+                // Check if this is a season pack task
+                const taskEpisodeMatch = taskKey.match(
+                    /(\d+):s(\d+)e(\d+)::/
+                );
+                if (taskEpisodeMatch && infoHash) {
+                    const seasonNum = parseInt(taskEpisodeMatch[2]);
+                    const episodeNum = parseInt(taskEpisodeMatch[3]);
+
+                    // This is a season pack — configure file priority for only the single active episode in the pack
+                    console.log(
+                        `[SeasonPack] Setting file priority for S${seasonNum}E${episodeNum} in infoHash ${infoHash}.`
+                    );
+                    setSeasonPackPriorities(infoHash, [{ season: seasonNum, episode: episodeNum }]).catch(
+                        e => console.error('[SeasonPack] Priority set failed:', e)
+                    );
+                }
+
+                try {
+                    await invoke('db_save_download', {
+                        record: {
+                            id: showId,
+                            title: media.title || media.name || `Media ${showId}`,
+                            year: media.year ? parseInt(String(media.year)) : null,
+                            file_path: "",
+                            file_size: null,
+                            info_hash: infoHash || null,
+                            status: 'downloading',
+                            downloaded_at: new Date().toISOString(),
+                        }
+                    });
+                } catch(e) {}
+            } else if (streamUrl) {
+                // Direct download
+                (async () => {
+                    try {
+                        const resultPath = await invoke<string>("download_media", {
+                            id: showId,
+                            url: streamUrl
+                        });
+                        const finalSize = useDownloadStore.getState().tasks[taskKey]?.size || 5 * 1024 * 1024;
+                        useDownloadStore.getState().completeDownload(taskKey, resultPath, finalSize);
+                    } catch (error) {
+                        console.error("HTTP Download failed:", error);
+                        useDownloadStore.getState().setStatus(taskKey, 'error', String(error));
+                    }
+                })();
+            } else {
+                throw new Error("No download URL or magnet link available for this task.");
+            }
+        } catch (error) {
+            console.error("Native queue trigger failed:", error);
+            store.setStatus(taskKey, 'error', String(error));
+        }
+    } else {
+        // Web flow
+        if (magnetUrl || (streamUrl && streamUrl.startsWith('magnet:'))) {
+            const finalMagnet = magnetUrl || streamUrl!;
+            const p2pBase = 'http://127.0.0.1:8083/p2p-proxy';
+            try {
+                const res = await fetch(`${p2pBase}/torrents`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ magnet: finalMagnet })
+                });
+                if (!res.ok) {
+                    console.warn("Proxy torrent add failed, using client-side mock progress simulator");
+                }
+            } catch (e) {
+                console.warn("Web Torrent engine offline, starting client-side mock download mode");
+            }
+        } else {
+            console.log("[QueueManager] Starting client-side mock download mode for web HTTP stream");
+        }
+    }
+};
+
+const promoteQueueIfReady = async () => {
+    const state = useDownloadStore.getState();
+    const activeTasks = Object.values(state.tasks).filter(t => t.status === 'downloading');
+    
+    // We only allow 1 concurrent download
+    if (activeTasks.length >= 1) {
+        return;
+    }
+
+    const queuedTasks = Object.entries(state.tasks)
+        .filter(([_, t]) => t.status === 'queued')
+        .sort((a, b) => (a[1].createdAt ?? 0) - (b[1].createdAt ?? 0));
+
+    if (queuedTasks.length > 0) {
+        const [taskKey, oldestTask] = queuedTasks[0];
+        
+        // Bug 2: Engine health check before promoting task
+        try {
+            const res = await fetch("http://127.0.0.1:3030/torrents", { signal: AbortSignal.timeout(1000) });
+            if (!res.ok) throw new Error("Engine not ready");
+        } catch (e) {
+            if (isTauri) {
+                try {
+                    const { invoke } = await import("@tauri-apps/api/core");
+                    await invoke("spawn_p2p_engine");
+                    // Wait for it to boot
+                    await new Promise(r => setTimeout(r, 2000));
+                } catch (err) {}
+            }
+        }
+
+        // Promote to downloading status
+        state.setStatus(taskKey, 'downloading');
+        // Trigger actual download engine
+        await triggerActualDownload(taskKey, oldestTask);
+    }
+};
 
 export const initDownloadManager = async () => {
     // Register Service Worker for Web Mode
@@ -30,8 +298,15 @@ export const initDownloadManager = async () => {
             await listen("download-progress", (event: any) => {
                 const { id, progress, downloaded_bytes, total_bytes, speed, peers } = event.payload;
                 const state = useDownloadStore.getState();
-                const taskKey = Object.keys(state.tasks).find(k => k.startsWith(`${id}::`) || k.startsWith(`${id}:s`)) || String(id);
-                state.updateProgress(taskKey, progress, downloaded_bytes, total_bytes, speed, peers);
+                const taskKey = Object.keys(state.tasks).find(k => {
+                    const t = state.tasks[k];
+                    return (k.startsWith(`${id}::`) || k.startsWith(`${id}:s`)) && t.status === 'downloading';
+                }) || String(id);
+                
+                // Only update progress if the task is actively downloading
+                if (state.tasks[taskKey]?.status === 'downloading') {
+                    state.updateProgress(taskKey, progress, downloaded_bytes, total_bytes, speed, peers);
+                }
             });
 
             console.log("DownloadManager: Tauri listeners initialized");
@@ -44,6 +319,7 @@ export const initDownloadManager = async () => {
             // ── Unified status + progress reconciler (runs in Tauri too) ────────
             const reconcileTorrentStates = async () => {
                 try {
+                    await promoteQueueIfReady();
                     // 1. Engine health check (regardless of active tasks — needed for manual start)
                     const torrentListRes = await fetch(`${P2P_BASE}/torrents`);
                     const isReady = torrentListRes.ok;
@@ -71,6 +347,7 @@ export const initDownloadManager = async () => {
 
                     for (const [taskKey, task] of Object.entries(state.tasks)) {
                         if (!task.infoHash) continue;
+                        if (task.status !== 'downloading') continue; // Only reconcile active downloading tasks!
 
                         const taskHash = task.infoHash.toLowerCase();
 
@@ -96,9 +373,23 @@ export const initDownloadManager = async () => {
                                 if (ts.finished && liveState.tasks[taskKey] && (liveState.tasks[taskKey].status !== "completed" || liveState.tasks[taskKey].filePath === "p2p-engine")) {
                                     const { invoke } = await import("@tauri-apps/api/core");
                                     try {
-                                        const res: any = await invoke("sync_download_path", { id: task.media.id, infoHash: taskHash });
-                                        // Check if this is an episode download (taskKey contains season/episode info)
                                         const isEpisode = taskKey.includes(':s');
+                                        let seasonNum: number | undefined;
+                                        let episodeNum: number | undefined;
+                                        if (isEpisode) {
+                                            const match = taskKey.match(/:s(\d+)e(\d+)/i);
+                                            if (match) {
+                                                seasonNum = parseInt(match[1], 10);
+                                                episodeNum = parseInt(match[2], 10);
+                                            }
+                                        }
+
+                                        const res: any = await invoke("sync_download_path", {
+                                            id: task.media.id,
+                                            infoHash: taskHash,
+                                            season: seasonNum,
+                                            episode: episodeNum
+                                        });
                                         if (isEpisode) {
                                             const episodeKey = taskKey.split('::')[0];
                                             liveState.completeEpisodeDownload(episodeKey, taskKey, res, ts.total_bytes);
@@ -118,6 +409,51 @@ export const initDownloadManager = async () => {
                                         await invoke("stop_torrent_engine", { infoHash: taskHash }).catch(() => {});
                                     }
 
+                                    // Scan for all video files this torrent produced
+                                    try {
+                                        const { invoke } = await import('@tauri-apps/api/core');
+                                        const scanned: any[] = await invoke('scan_local_library');
+
+                                        const allTasks = useDownloadStore.getState().tasks;
+
+                                        // Find sibling episode tasks sharing this infoHash
+                                        const siblings = Object.entries(allTasks).filter(
+                                            ([k, t]) =>
+                                                t.infoHash === taskHash &&
+                                                k !== taskKey &&
+                                                k.includes(':s')
+                                        );
+
+                                        for (const [sibKey, sibTask] of siblings) {
+                                            const sibMatch = sibKey.match(/:s(\d+)e(\d+)/);
+                                            if (!sibMatch) continue;
+
+                                            const sibSeason = parseInt(sibMatch[1]);
+                                            const sibEpisode = parseInt(sibMatch[2]);
+
+                                            // Find the matching file from the scan
+                                            const matched = scanned.find(f =>
+                                                matchFileToEpisode(f.file_path, sibSeason, sibEpisode)
+                                            );
+
+                                            if (matched) {
+                                                const episodeKey = sibKey.split('::')[0];
+                                                liveState.completeEpisodeDownload(
+                                                    episodeKey,
+                                                    sibKey,
+                                                    matched.file_path,
+                                                    matched.file_size
+                                                );
+                                                console.log(
+                                                    `[SeasonPack] Auto-completed sibling episode ` +
+                                                    `${sibKey} → ${matched.file_path}`
+                                                );
+                                            }
+                                        }
+                                    } catch (e) {
+                                        console.error('[SeasonPack] Post-completion scan failed:', e);
+                                    }
+
                                     // Auto-trigger on download completion
                                     scanAndSyncLibrary().catch(console.error);
 
@@ -134,8 +470,13 @@ export const initDownloadManager = async () => {
                             }
                         } else {
                             // The engine doesn't have this torrent (e.g. it was restarted and not re-added)
-                            // If it's not completed, it's stuck. We leave the status alone, but the user 
-                            // can clear/retry it in the UI.
+                            // Bug 3: If it's stuck in downloading state with 0 progress for > 30s, reset it to queued
+                            const progress = task.progress ?? 0;
+                            const createdAt = task.createdAt ?? Date.now();
+                            if (progress === 0 && (Date.now() - createdAt > 30000)) {
+                                console.log(`Task ${taskKey} stuck in downloading without engine presence for >30s. Resetting to queued.`);
+                                state.setStatus(taskKey, 'queued');
+                            }
                         }
                     }
                 } catch (e) {
@@ -155,6 +496,7 @@ export const initDownloadManager = async () => {
         const activeWebIntervals = new Map<string, boolean>();
 
         const webPoll = async () => {
+            await promoteQueueIfReady();
             let isReady = false;
             try {
                 const res = await fetch(`${P2P_BASE}/torrents`);
@@ -181,9 +523,9 @@ export const initDownloadManager = async () => {
                     for (const t of (torrents.torrents || [])) {
                         const engineHash = t.info_hash.toLowerCase();
 
-                        // Find any tasks in our store that match this engine hash
+                        // Find any tasks in our store that match this engine hash and are actively downloading
                         const taskEntries = Object.entries(state.tasks).filter(
-                            ([_, task]) => task.infoHash?.toLowerCase() === engineHash
+                            ([_, task]) => task.infoHash?.toLowerCase() === engineHash && task.status === 'downloading'
                         );
 
                         if (taskEntries.length > 0) {
@@ -276,6 +618,8 @@ export const downloadEpisode = async (
     season: number,
     episode: number,
     imdbId: string,
+    posterPath?: string | null,
+    backdropPath?: string | null,
 ): Promise<void> => {
     const episodeKey = `${showId}:s${season}e${episode}`;
     const state = useDownloadStore.getState();
@@ -298,22 +642,9 @@ export const downloadEpisode = async (
             return;
         }
 
-        // Parse resolution from stream name/title — preference: 1080p → 720p → 480p
-        const getRes = (s: any): number => {
-            const raw = ((s.name ?? '') + ' ' + (s.title ?? '')).toLowerCase();
-            if (raw.includes('2160') || raw.includes('4k')) return 2160;
-            if (raw.includes('1080')) return 1080;
-            if (raw.includes('720')) return 720;
-            if (raw.includes('480') || raw.includes('hq')) return 480;
-            if (raw.includes('360')) return 360;
-            return 0;
-        };
-
-        let bestStream: any | undefined;
-        for (const target of [1080, 720, 480]) {
-            bestStream = data.streams.find((s: any) => getRes(s) === target);
-            if (bestStream) break;
-        }
+        // Select stream using user quality preference
+        const { defaultQuality } = useSettingsStore.getState();
+        let bestStream = pickBestTorrentioStream(data.streams, defaultQuality);
         if (!bestStream) bestStream = data.streams[0];
 
         // Construct magnet URL: Torrentio often has url="" and just an infoHash
@@ -340,67 +671,15 @@ export const downloadEpisode = async (
             id: showId,
             mediaType: 'tv',
             title: `${showName} - S${season}:E${episode}`,
-            posterPath: null,
-            backdropPath: null,
+            posterPath: posterPath || null,
+            backdropPath: backdropPath || null,
             year: '',
             rating: 0,
             genres: [],
             status: null,
         };
 
-        // Add task with 'downloading' status so the reconcile loop tracks it
-        useDownloadStore.setState((prev) => {
-            const newTasks = { ...prev.tasks, [taskKey]: { media: episodeMedia, progress: 0, status: 'downloading' as DownloadStatus, infoHash } };
-            saveToDisk('downloads', { tasks: newTasks, offlineLibrary: prev.offlineLibrary, episodeLibrary: prev.episodeLibrary });
-            return { tasks: newTasks };
-        });
-
-        const isTauri = !!(
-            typeof window !== 'undefined' &&
-            ('__TAURI_INTERNALS__' in window || '__TAURI__' in window || 'isTauri' in window)
-        );
-
-        if (isTauri) {
-            try {
-                const { invoke } = await import('@tauri-apps/api/core');
-                // Spawn engine if not already running
-                if (!useDownloadStore.getState().p2pEngineReady) {
-                    try { await invoke('spawn_p2p_engine'); } catch { /* already running */ }
-                    await new Promise(r => setTimeout(r, 1500));
-                }
-                await invoke('start_p2p_download', { id: showId, magnet: magnetUrl });
-                try {
-                    await invoke('db_save_download', {
-                        record: {
-                            id: showId,
-                            title: `${showName} S${season}:E${episode}`,
-                            year: null,
-                            file_path: "",
-                            file_size: null,
-                            info_hash: infoHash || null,
-                            status: 'downloading',
-                            downloaded_at: new Date().toISOString(),
-                        }
-                    });
-                } catch(e) {}
-            } catch (e) {
-                console.error('Failed to start P2P download for episode:', e);
-            }
-        } else {
-            const p2pBase = 'http://127.0.0.1:8083/p2p-proxy';
-            try {
-                const addRes = await fetch(`${p2pBase}/torrents`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ magnet: magnetUrl }),
-                });
-                if (!addRes.ok) {
-                    // Fail silently here, background mock simulator will process the downloading state
-                }
-            } catch (e) {
-                console.error('Failed to start web P2P download for episode, using client-side mock progress:', e);
-            }
-        }
+        state.addTask(episodeMedia, infoHash, magnetUrl || undefined, streamUrl || undefined, taskKey);
     } catch (e) {
         console.error(`Failed to download episode ${showName} S${season}:E${episode}:`, e);
     }
@@ -412,6 +691,8 @@ export const downloadSeason = async (
     season: number,
     imdbId: string,
     episodeCount: number,
+    posterPath?: string | null,
+    backdropPath?: string | null,
 ): Promise<void> => {
     for (let ep = 1; ep <= episodeCount; ep++) {
         const episodeKey = `${showId}:s${season}e${ep}`;
@@ -419,7 +700,7 @@ export const downloadSeason = async (
         if (state.episodeLibrary[episodeKey] || Object.keys(state.tasks).some(k => k.startsWith(episodeKey))) {
             continue;
         }
-        await downloadEpisode(showId, showName, season, ep, imdbId);
+        await downloadEpisode(showId, showName, season, ep, imdbId, posterPath, backdropPath);
         await new Promise(r => setTimeout(r, 500));
     }
 };
@@ -430,86 +711,18 @@ export const startDownload = async (media: StreamVaultMedia, streamUrl?: string)
     const taskKey = infoHash ? `${media.id}::${infoHash}` : String(media.id);
 
     // Don't restart if already in progress or library
-    if (store.tasks[taskKey]?.status === 'downloading' || store.offlineLibrary[media.id]) {
+    if (store.tasks[taskKey] || store.offlineLibrary[media.id]) {
         return taskKey;
     }
 
     try {
-        store.addTask(media, infoHash);
-        store.setStatus(taskKey, 'downloading');
+        const isMagnet = streamUrl?.startsWith('magnet:');
+        const magnetUrl = isMagnet ? streamUrl : undefined;
+        const directUrl = !isMagnet ? streamUrl : undefined;
+        
+        store.addTask(media, infoHash, magnetUrl, directUrl, taskKey);
     } catch (e) {
         console.error("Failed to register download task:", e);
-        return taskKey;
-    }
-
-    if (isTauri) {
-        try {
-            const { invoke } = await import("@tauri-apps/api/core");
-
-            if (!streamUrl) {
-                throw new Error("No streamable source found for this title yet.");
-            }
-
-            // Handle BitTorrent Magnets separately (Native Rust Engine)
-            if (streamUrl.startsWith('magnet:')) {
-                await invoke("spawn_p2p_engine");
-                await new Promise(r => setTimeout(r, 1500)); // give engine a moment to bind
-
-                await invoke("start_p2p_download", {
-                    id: media.id,
-                    magnet: streamUrl
-                });
-                try {
-                    await invoke('db_save_download', {
-                        record: {
-                            id: media.id,
-                            title: media.title || media.name || `Media ${media.id}`,
-                            year: media.year ? parseInt(String(media.year)) : null,
-                            file_path: "",
-                            file_size: null,
-                            info_hash: infoHash || null,
-                            status: 'downloading',
-                            downloaded_at: new Date().toISOString(),
-                        }
-                    });
-                } catch(e) {}
-                return taskKey;
-            }
-
-            const resultPath = await invoke<string>("download_media", {
-                id: media.id,
-                url: streamUrl
-            });
-
-            const finalSize = store.tasks[taskKey]?.size || 5 * 1024 * 1024;
-            store.completeDownload(taskKey, resultPath, finalSize);
-        } catch (error) {
-            console.error("Download failed:", error);
-            store.setStatus(taskKey, 'error', String(error));
-        }
-    } else {
-        // Web flow - direct rqbit API via Native Proxy, fallback to mock if unreachable
-        if (streamUrl?.startsWith('magnet:')) {
-            try {
-                const res = await fetch(`${P2P_BASE}/torrents?is_url=true`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'text/plain' },
-                    body: streamUrl
-                });
-                if (!res.ok) {
-                    // Fallback to client-side mock progress simulator
-                    store.setStatus(taskKey, 'downloading');
-                    return taskKey;
-                }
-                return taskKey;
-            } catch (e) {
-                console.warn("Web Torrent engine offline, starting client-side mock download mode");
-                store.setStatus(taskKey, 'downloading');
-            }
-        } else {
-            // Direct streaming links: trigger client-side mock progress simulator
-            store.setStatus(taskKey, 'downloading');
-        }
     }
     return taskKey;
 };
@@ -523,23 +736,30 @@ const encodeFilePath = (path: string): string => {
 };
 
 export const getOfflineStreamUrl = async (id: number, season?: number, episode?: number): Promise<string | null> => {
-    if (isTauri) {
-        try {
-            const { invoke } = await import('@tauri-apps/api/core');
-            const playableUrl = await invoke<string>('get_playable_url', { id });
-            if (playableUrl) {
-                return playableUrl;
-            }
-        } catch (e) {
-            console.error('get_playable_url failed:', e);
-        }
+    const store = useDownloadStore.getState();
+    let filePath: string | undefined;
+
+    if (season !== undefined && episode !== undefined) {
+        const episodeKey = `${id}:s${season}e${episode}`;
+        filePath = store.episodeLibrary[episodeKey]?.filePath;
+    } else {
+        filePath = store.offlineLibrary[id]?.filePath;
     }
 
-    // Web fallback or failure to resolve
-    const store = useDownloadStore.getState();
-    const item = store.offlineLibrary[id];
-    if (item?.blobId) {
-        return item.blobId;
+    console.log("[getOfflineStreamUrl] Searching for id:", id, "season:", season, "episode:", episode);
+    console.log("[getOfflineStreamUrl] episodeLibrary contains:", Object.keys(store.episodeLibrary));
+    console.log("[getOfflineStreamUrl] Selected filePath:", filePath);
+
+    if (isTauri && filePath) {
+        return `http://127.0.0.1:8083/p2p-stream/?path=${encodeFilePath(filePath)}`;
+    }
+
+    // Web fallback
+    if (season === undefined || episode === undefined) {
+        const item = store.offlineLibrary[id];
+        if (item?.blobId) {
+            return item.blobId;
+        }
     }
     
     return null;
@@ -559,6 +779,9 @@ export interface ScannedFile {
     parsed_title: string;
     parsed_year: number | null;
     file_size: number;
+    media_type: 'movie' | 'tv';
+    season: number | null;
+    episode: number | null;
 }
 
 export async function scanAndSyncLibrary(): Promise<void> {
@@ -568,43 +791,100 @@ export async function scanAndSyncLibrary(): Promise<void> {
     // 1. Get all video files Rust found
     const scannedFiles: ScannedFile[] = await invoke('scan_local_library');
 
-    const { searchMovies } = await import('@/lib/tmdb');
+    const { searchMovies, searchTVShows } = await import('@/lib/tmdb');
 
     // 2. For each file, search TMDB and upsert to DB
     for (const file of scannedFiles) {
         try {
-            // Use existing TMDB search wrapper
-            const results = await searchMovies(file.parsed_title);
-            if (!results || !results.results || results.results.length === 0) continue;
+            if (file.media_type === 'tv') {
+                const results = await searchTVShows(file.parsed_title);
+                if (!results || !results.results || results.results.length === 0) continue;
 
-            const match = results.results[0]; // Best match is always first
+                const match = results.results[0]; // Best match is always first
+                const showId = match.id;
+                const season = file.season ?? 1;
+                const episode = file.episode ?? 1;
 
-            // 3. Upsert to SQLite
-            await invoke('db_save_download', {
-                record: {
-                    id: match.id,
-                    title: match.title,
-                    year: match.release_date
-                        ? parseInt(match.release_date.substring(0, 4))
-                        : file.parsed_year,
-                    file_path: file.file_path,
-                    file_size: file.file_size,
-                    info_hash: null,
-                    status: 'complete',
-                    downloaded_at: new Date().toISOString(),
+                const paddedSeason = String(season).padStart(2, '0');
+                const paddedEpisode = String(episode).padStart(2, '0');
+                const formattedTitle = `${match.name} - S${paddedSeason}:E${paddedEpisode}`;
+
+                // 3. Upsert to SQLite
+                await invoke('db_save_download', {
+                    record: {
+                        id: showId,
+                        title: formattedTitle,
+                        year: match.first_air_date
+                            ? parseInt(match.first_air_date.substring(0, 4))
+                            : file.parsed_year,
+                        file_path: file.file_path,
+                        file_size: file.file_size,
+                        info_hash: null,
+                        status: 'complete',
+                        downloaded_at: new Date().toISOString(),
+                    }
+                });
+
+                // Add to episodeLibrary in Zustand
+                const episodeMedia = {
+                    id: showId,
+                    mediaType: 'tv',
+                    title: `${match.name} - S${season}:E${episode}`,
+                    posterPath: match.poster_path,
+                    backdropPath: match.backdrop_path,
+                    year: match.first_air_date ? match.first_air_date.substring(0, 4) : String(file.parsed_year || ""),
+                    rating: match.vote_average ?? 0,
+                    genres: [],
+                    status: null,
+                };
+
+                const episodeKey = `${showId}:s${season}e${episode}`;
+                const taskKey = `${episodeKey}::scanned`;
+
+                if (!store.tasks[taskKey]) {
+                    store.addTask(episodeMedia as any, undefined, undefined, undefined, taskKey);
                 }
-            });
 
-            const { normalizeMedia } = await import('@/lib/tmdb-types');
-            const normalized = normalizeMedia(match, 'movie');
+                store.completeEpisodeDownload(
+                    episodeKey,
+                    taskKey,
+                    file.file_path,
+                    file.file_size
+                );
+            } else {
+                // Use existing TMDB search wrapper
+                const results = await searchMovies(file.parsed_title);
+                if (!results || !results.results || results.results.length === 0) continue;
 
-            // 4. Sync into Zustand offlineLibrary
-            store.completeDownload(
-                String(match.id),
-                file.file_path,
-                file.file_size,
-                normalized
-            );
+                const match = results.results[0]; // Best match is always first
+
+                // 3. Upsert to SQLite
+                await invoke('db_save_download', {
+                    record: {
+                        id: match.id,
+                        title: match.title,
+                        year: match.release_date
+                            ? parseInt(match.release_date.substring(0, 4))
+                            : file.parsed_year,
+                        file_path: file.file_path,
+                        file_size: file.file_size,
+                        info_hash: null,
+                        status: 'complete',
+                        downloaded_at: new Date().toISOString(),
+                    }
+                });
+
+                const { normalizeMedia } = await import('@/lib/tmdb-types');
+                const normalized = normalizeMedia(match, 'movie');
+
+                // 4. Sync into Zustand offlineLibrary
+                store.completeDownload(
+                    String(match.id),
+                    file.file_path,
+                    file.file_size,
+                    normalized
+                );
+            }
 
         } catch (err) {
             console.error(`Failed to match "${file.parsed_title}":`, err);
@@ -637,5 +917,35 @@ export async function scanAndSyncLibrary(): Promise<void> {
                 console.error("Failed to remove orphaned item:", e);
             }
         }
+    }
+
+    // 6. Clean up TV episode orphans (files deleted from disk manually)
+    const episodeLibrary = store.episodeLibrary;
+    let episodeLibraryChanged = false;
+    const newEpisodeLibrary = { ...episodeLibrary };
+
+    for (const [episodeKey, item] of Object.entries(episodeLibrary)) {
+        const normalizedItemPath = item.filePath ? item.filePath.replace(/\\/g, '/').toLowerCase() : "";
+        
+        const hasValidFileOnDisk = item.filePath && 
+                                   item.filePath !== "p2p-engine" && 
+                                   currentPaths.has(normalizedItemPath);
+
+        if (!hasValidFileOnDisk) {
+            delete newEpisodeLibrary[episodeKey];
+            episodeLibraryChanged = true;
+            console.log(`Removed orphaned episode record for ${episodeKey} (${item.filePath})`);
+        }
+    }
+
+    if (episodeLibraryChanged) {
+        useDownloadStore.setState({ episodeLibrary: newEpisodeLibrary });
+        // Save the updated library to disk
+        const latestState = useDownloadStore.getState();
+        saveToDisk('downloads', {
+            tasks: latestState.tasks,
+            offlineLibrary: latestState.offlineLibrary,
+            episodeLibrary: newEpisodeLibrary
+        });
     }
 }

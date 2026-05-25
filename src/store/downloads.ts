@@ -17,6 +17,9 @@ export interface DownloadTask {
     filePath?: string; // For Tauri (local path to encrypted file)
     blobId?: string; // For Web (IndexedDB key)
     infoHash?: string;
+    createdAt?: number;
+    magnetUrl?: string;
+    streamUrl?: string;
 }
 
 export interface GlobalStats {
@@ -34,12 +37,12 @@ interface DownloadState {
     globalStats: GlobalStats | null;
 
     // Actions
-    addTask: (media: StreamVaultMedia, infoHash?: string) => string;
+    addTask: (media: StreamVaultMedia, infoHash?: string, magnetUrl?: string, streamUrl?: string, customTaskKey?: string) => string;
     removeTask: (taskKey: string) => Promise<void>;
     updateProgress: (taskKey: string, progress: number, downloadedBytes?: number, totalSize?: number, speed?: string, peers?: number) => void;
     setStatus: (taskKey: string, status: DownloadStatus, error?: string) => void;
-    completeDownload: (taskKey: string, pathOrBlob: string, size: number, directMedia?: StreamVaultMedia) => void;
-    completeEpisodeDownload: (episodeKey: string, taskKey: string, pathOrBlob: string, size: number) => void;
+    completeDownload: (taskKey: string, pathOrBlob: string, size: number, directMedia?: StreamVaultMedia) => Promise<void>;
+    completeEpisodeDownload: (episodeKey: string, taskKey: string, pathOrBlob: string, size: number) => Promise<void>;
     removeEpisodeDownload: (episodeKey: string) => Promise<void>;
     setP2pReady: (ready: boolean) => void;
     setGlobalStats: (stats: GlobalStats) => void;
@@ -57,8 +60,21 @@ export const useDownloadStore = create<DownloadState>()(
             p2pEngineReady: false,
             globalStats: null,
 
-            addTask: (media, infoHash) => {
-                const taskKey = infoHash ? `${media.id}::${infoHash}` : String(media.id);
+            addTask: (media, infoHash, magnetUrl, streamUrl, customTaskKey) => {
+                const isEpisode = media.title.includes(' - S') && media.title.includes(':E');
+                let calculatedKey = infoHash ? `${media.id}::${infoHash}` : String(media.id);
+                if (infoHash && isEpisode) {
+                    const match = media.title.match(/(.*)\s+-\s+S(\d+):E(\d+)/);
+                    if (match) {
+                        const showId = media.id;
+                        const season = match[2];
+                        const episode = match[3];
+                        const episodeKey = `${showId}:s${season}e${episode}`;
+                        calculatedKey = `${episodeKey}::${infoHash}`;
+                    }
+                }
+                const taskKey = customTaskKey || calculatedKey;
+
                 set((state) => {
                     if (state.tasks[taskKey] || state.offlineLibrary[media.id]) return state;
                     const newTasks = {
@@ -67,7 +83,10 @@ export const useDownloadStore = create<DownloadState>()(
                             media,
                             progress: 0,
                             status: 'queued' as DownloadStatus,
-                            infoHash
+                            infoHash,
+                            createdAt: Date.now(),
+                            magnetUrl,
+                            streamUrl
                         }
                     };
                     saveToDisk('downloads', { tasks: newTasks, offlineLibrary: state.offlineLibrary, episodeLibrary: state.episodeLibrary });
@@ -188,7 +207,7 @@ export const useDownloadStore = create<DownloadState>()(
                 }
             },
 
-            completeEpisodeDownload: (episodeKey, taskKey, pathOrBlob, size) => {
+            completeEpisodeDownload: async (episodeKey, taskKey, pathOrBlob, size) => {
                 set((state) => {
                     const task = state.tasks[taskKey];
                     if (!task) return state;
@@ -216,6 +235,44 @@ export const useDownloadStore = create<DownloadState>()(
                     saveToDisk('downloads', { tasks: newTasks, offlineLibrary: state.offlineLibrary, episodeLibrary: newLibrary });
                     return { tasks: newTasks, episodeLibrary: newLibrary };
                 });
+
+                // Persist to SQLite database (single source of truth)
+                const isTauri = typeof window !== 'undefined' &&
+                    ('__TAURI_INTERNALS__' in window || '__TAURI__' in window || 'isTauri' in window);
+
+                if (isTauri) {
+                    try {
+                        const { invoke } = await import('@tauri-apps/api/core');
+                        const state = get();
+                        const completedTask = state.episodeLibrary[episodeKey];
+                        if (completedTask && completedTask.media) {
+                            const [showIdStr, epMatch] = episodeKey.split(':s');
+                            const showId = parseInt(showIdStr, 10);
+                            let seasonNum = null;
+                            let episodeNum = null;
+                            if (epMatch) {
+                                const [sStr, eStr] = epMatch.split('e');
+                                seasonNum = parseInt(sStr, 10);
+                                episodeNum = parseInt(eStr, 10);
+                            }
+
+                            await invoke('db_save_download', {
+                                record: {
+                                    id: showId,
+                                    title: completedTask.media.title || completedTask.media.name || `TV Show ${showId}`,
+                                    year: completedTask.media.year ? parseInt(String(completedTask.media.year)) : null,
+                                    file_path: completedTask.filePath || '',
+                                    file_size: completedTask.size || null,
+                                    info_hash: completedTask.infoHash || null,
+                                    status: 'complete',
+                                    downloaded_at: new Date().toISOString()
+                                }
+                            });
+                        }
+                    } catch (e) {
+                        console.error('Failed to save episode download record:', e);
+                    }
+                }
             },
 
             removeEpisodeDownload: async (episodeKey) => {
@@ -226,10 +283,14 @@ export const useDownloadStore = create<DownloadState>()(
                 const isTauri = typeof window !== 'undefined' &&
                     ('__TAURI_INTERNALS__' in window || '__TAURI__' in window || 'isTauri' in window);
 
-                if (isTauri && task.media) {
+                if (isTauri) {
                     try {
                         const { invoke } = await import("@tauri-apps/api/core");
-                        await invoke("delete_media_file", { id: task.media.id });
+                        if (task.filePath) {
+                            await invoke("delete_file_by_path", { path: task.filePath });
+                        } else if (task.media) {
+                            await invoke("delete_media_file", { id: task.media.id });
+                        }
                     } catch (e) {
                         console.error("Failed to delete episode media file:", e);
                     }

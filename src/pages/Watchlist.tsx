@@ -4,7 +4,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
-import { ChevronDown, X, ChevronLeft } from "lucide-react";
+import { ChevronDown, X, ChevronLeft, Bookmark } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import Navbar from "@/components/Navbar";
 import WatchlistCard from "@/components/watchlist/WatchlistCard";
@@ -20,10 +20,10 @@ const STATUS_TABS: { value: WatchStatus; label: string }[] = [
 ];
 
 const EMPTY_MESSAGES: Record<WatchStatus, { text: string; sub: string }> = {
-    want: { text: "Nothing here yet.", sub: "Start browsing!" },
-    watching: { text: "Nothing in progress.", sub: "Pick something!" },
-    done: { text: "Your completed titles appear here.", sub: "" },
-    paused: { text: "Paused titles show here.", sub: "" },
+    want: { text: "No pending titles.", sub: "Add titles from browse or search to plan your next watch!" },
+    watching: { text: "No active watches.", sub: "Resume watching titles from where you left off!" },
+    done: { text: "No completed titles yet.", sub: "Finish titles in your library to mark them complete." },
+    paused: { text: "No paused titles.", sub: "Temporarily pause active titles and they'll show here." },
 };
 
 const WatchlistPage = () => {
@@ -83,65 +83,80 @@ const WatchlistPage = () => {
                     <p className="text-[#AEAEB2] mt-1">{items.length} title{items.length !== 1 ? "s" : ""}</p>
                 </div>
 
-                <Tabs defaultValue="want">
-                    {/* Tab bar */}
-                    <TabsList className="w-full justify-start bg-[#1C1C1E] border-b border-[#3A3A3C] rounded-none px-0 h-auto mb-0">
-                        {STATUS_TABS.map(({ value, label }) => (
-                            <TabsTrigger
-                                key={value}
-                                value={value}
-                                className="px-4 py-3 rounded-none data-[state=active]:text-white data-[state=active]:border-b-2 data-[state=active]:border-[#E50914] data-[state=inactive]:text-[#AEAEB2] bg-transparent hover:text-white transition-colors text-sm"
-                            >
-                                {label} ({items.filter(i => i.status === value).length})
-                            </TabsTrigger>
-                        ))}
-                    </TabsList>
-
-                    {/* Controls row */}
-                    <div className="flex items-center justify-between py-4 border-b border-[#3A3A3C]">
-                        <Select value={sort} onValueChange={(v) => setSort(v as SortOption)}>
-                            <SelectTrigger className="w-[180px] bg-[#1C1C1E] border-[#3A3A3C] text-white h-9">
-                                <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent className="bg-[#1C1C1E] border-[#3A3A3C] text-white">
-                                <SelectItem value="date" className="hover:bg-[#2C2C2E] focus:bg-[#2C2C2E]">Date Added</SelectItem>
-                                <SelectItem value="rating" className="hover:bg-[#2C2C2E] focus:bg-[#2C2C2E]">Rating</SelectItem>
-                                <SelectItem value="alpha" className="hover:bg-[#2C2C2E] focus:bg-[#2C2C2E]">A–Z</SelectItem>
-                                <SelectItem value="leaving" className="hover:bg-[#2C2C2E] focus:bg-[#2C2C2E]">Leaving Soonest</SelectItem>
-                            </SelectContent>
-                        </Select>
+                {items.length === 0 ? (
+                    <div className="flex flex-col items-center justify-center py-24 text-center animate-in fade-in max-w-md mx-auto">
+                        <div className="w-20 h-20 rounded-full bg-[#1C1C1E] flex items-center justify-center mb-6 border border-[#3A3A3C]/40 shadow-[0_8px_30px_rgb(0,0,0,0.4)]">
+                            <Bookmark className="w-10 h-10 text-[#636366]" />
+                        </div>
+                        <h2 className="text-xl font-bold mb-2 text-white">Your Watchlist is Empty</h2>
+                        <p className="text-[#AEAEB2] text-sm max-w-sm mb-8 leading-relaxed">
+                            Keep track of movies and TV shows you want to watch, are currently watching, or have already completed.
+                        </p>
+                        <Button asChild className="bg-[#E50914] hover:bg-[#B00610] text-white px-8 h-11 rounded-md text-sm font-semibold transition-all shadow-[0_4px_14px_rgba(229,9,20,0.4)] hover:shadow-[0_6px_20px_rgba(229,9,20,0.6)]">
+                            <Link to="/browse">Discover Media</Link>
+                        </Button>
                     </div>
+                ) : (
+                    <Tabs defaultValue="want">
+                        {/* Tab bar */}
+                        <TabsList className="w-full justify-start bg-[#1C1C1E] border-b border-[#3A3A3C] rounded-none px-0 h-auto mb-0">
+                            {STATUS_TABS.map(({ value, label }) => (
+                                <TabsTrigger
+                                    key={value}
+                                    value={value}
+                                    className="px-4 py-3 rounded-none data-[state=active]:text-white data-[state=active]:border-b-2 data-[state=active]:border-[#E50914] data-[state=inactive]:text-[#AEAEB2] bg-transparent hover:text-white transition-colors text-sm"
+                                >
+                                    {label} ({items.filter(i => i.status === value).length})
+                                </TabsTrigger>
+                            ))}
+                        </TabsList>
 
-                    {/* Tab content */}
-                    {STATUS_TABS.map(({ value }) => {
-                        const list = getItems(value);
-                        const empty = EMPTY_MESSAGES[value];
-                        return (
-                            <TabsContent key={value} value={value} className="mt-4 space-y-3">
-                                {list.length === 0 ? (
-                                    <div className="flex flex-col items-center justify-center py-20 gap-4">
-                                        <p className="text-white text-lg font-medium">{empty.text}</p>
-                                        {empty.sub && <p className="text-[#AEAEB2] text-sm">{empty.sub}</p>}
-                                        {value === "want" && (
-                                            <Link to="/browse">
-                                                <Button className="bg-[#E50914] hover:bg-[#B00610] text-white mt-2">Browse</Button>
-                                            </Link>
-                                        )}
-                                    </div>
-                                ) : (
-                                    list.map((item) => (
-                                        <WatchlistCard
-                                            key={item.id}
-                                            id={item.id}
-                                            checked={checked.has(item.id)}
-                                            onCheck={toggleCheck}
-                                        />
-                                    ))
-                                )}
-                            </TabsContent>
-                        );
-                    })}
-                </Tabs>
+                        {/* Controls row */}
+                        <div className="flex items-center justify-between py-4 border-b border-[#3A3A3C]">
+                            <Select value={sort} onValueChange={(v) => setSort(v as SortOption)}>
+                                <SelectTrigger className="w-[180px] bg-[#1C1C1E] border-[#3A3A3C] text-white h-9">
+                                    <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent className="bg-[#1C1C1E] border-[#3A3A3C] text-white">
+                                    <SelectItem value="date" className="hover:bg-[#2C2C2E] focus:bg-[#2C2C2E]">Date Added</SelectItem>
+                                    <SelectItem value="rating" className="hover:bg-[#2C2C2E] focus:bg-[#2C2C2E]">Rating</SelectItem>
+                                    <SelectItem value="alpha" className="hover:bg-[#2C2C2E] focus:bg-[#2C2C2E]">A–Z</SelectItem>
+                                    <SelectItem value="leaving" className="hover:bg-[#2C2C2E] focus:bg-[#2C2C2E]">Leaving Soonest</SelectItem>
+                                </SelectContent>
+                            </Select>
+                        </div>
+
+                        {/* Tab content */}
+                        {STATUS_TABS.map(({ value }) => {
+                            const list = getItems(value);
+                            const empty = EMPTY_MESSAGES[value];
+                            return (
+                                <TabsContent key={value} value={value} className="mt-4 space-y-3">
+                                    {list.length === 0 ? (
+                                        <div className="flex flex-col items-center justify-center py-20 text-center gap-2">
+                                            <p className="text-white text-lg font-medium">{empty.text}</p>
+                                            {empty.sub && <p className="text-[#AEAEB2] text-sm max-w-xs leading-relaxed">{empty.sub}</p>}
+                                            {value === "want" && (
+                                                <Link to="/browse">
+                                                    <Button className="bg-[#E50914] hover:bg-[#B00610] text-white mt-4 h-9 px-6 font-semibold">Browse Titles</Button>
+                                                </Link>
+                                            )}
+                                        </div>
+                                    ) : (
+                                        list.map((item) => (
+                                            <WatchlistCard
+                                                key={item.id}
+                                                id={item.id}
+                                                checked={checked.has(item.id)}
+                                                onCheck={toggleCheck}
+                                            />
+                                        ))
+                                    )}
+                                </TabsContent>
+                            );
+                        })}
+                    </Tabs>
+                )}
             </div>
 
             {/* Bulk action bar */}

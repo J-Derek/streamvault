@@ -22,5 +22,7 @@ commands.allow = [
     "db_remove_download",
     "sync_download_path",
     "stop_torrent_engine",
-    "get_playable_url"
+    "get_playable_url",
+    "remux_to_mp4",
+    "find_subtitle_files"
 ]

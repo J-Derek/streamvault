@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 
 import { normalizeMedia, PROVIDERS } from "@/lib/tmdb-types";
 import { getOfflineStreamUrl, startDownload } from "@/lib/downloads/manager";
+import { useDownloadStore } from "@/store/downloads";
 import { useToast } from "@/components/ui/use-toast";
 import { TorrentSelector } from "@/components/player/TorrentSelector";
 import VideoPlayer from "@/components/player/VideoPlayer";
@@ -26,6 +27,9 @@ const PlayerPage = () => {
     const mediaType = (queryParams.get("type") ?? "movie") as "movie" | "tv";
     const isMovie = mediaType === "movie";
     const numId = Number(id);
+    
+    const offlineLibrary = useDownloadStore(state => state.offlineLibrary);
+    const episodeLibrary = useDownloadStore(state => state.episodeLibrary);
 
     const containerRef = useRef<HTMLDivElement>(null);
     const [showUI, setShowUI] = useState(true);
@@ -125,7 +129,7 @@ const PlayerPage = () => {
             } else {
                 isOfflineFallback = false;
                 if (mirror === "webtor") {
-                    url = `https://webtor.io/embed#/magnet:?xt=urn:btih:${infoHash}&file-index=0`;
+                    url = `https://webtor.io/show?magnet=magnet:?xt=urn:btih:${infoHash}`;
                 } else if (mirror === "instant") {
                     url = `https://instant.io/#${infoHash}`;
                 } else if (mirror === "magnet-player") {
@@ -151,14 +155,27 @@ const PlayerPage = () => {
         }
 
         let finalOfflineUrl = d?.finalOfflineUrl;
-        if (isOfflineFallback && !finalOfflineUrl && !url) {
-            finalOfflineUrl = `http://127.0.0.1:8083/p2p-proxy/torrents/${infoHash.toLowerCase()}/stream/${fileIdx}`;
-        }
 
         return {
             d, title, contentId, imdb_id: imdbId, season, episode, infoHash, fileIdx, vidsrcUrl: url, isOffline: queryParams.get("offline") === "true" || !!finalOfflineUrl || isOfflineFallback, offlineUrl: finalOfflineUrl
         };
     }, [data, mediaType, numId, queryParams, selectedProvider, sourceParam]);
+
+    const filePath = useMemo(() => {
+        if (!meta) return undefined;
+        if (isMovie) {
+            return offlineLibrary[numId]?.filePath;
+        } else {
+            const key = `${numId}:s${meta.season}e${meta.episode}`;
+            return episodeLibrary[key]?.filePath;
+        }
+    }, [isMovie, numId, meta, offlineLibrary, episodeLibrary]);
+
+    const nextEpisodeKey = useMemo(() => {
+        if (isMovie || !meta) return undefined;
+        const key = `${numId}:s${meta.season}e${meta.episode + 1}`;
+        return episodeLibrary[key] ? key : undefined;
+    }, [isMovie, numId, meta, episodeLibrary]);
 
     const handleTorrentFallback = useCallback(() => {
         if (!data?.imdb_id) return;
@@ -330,7 +347,7 @@ const PlayerPage = () => {
                                                 {p.name}
                                             </DropdownMenuItem>
                                         ))}
-                                        <DropdownMenuItem onClick={handleTorrentFallback} className="cursor-pointer text-purple-400 focus:text-purple-300">
+                                        <DropdownMenuItem onClick={handleTorrentFallback} className="cursor-pointer text-[#E50914] focus:text-[#B00610]">
                                             <Magnet className="w-3.5 h-3.5 mr-2" />
                                             Stream from Torrent
                                         </DropdownMenuItem>
@@ -340,7 +357,7 @@ const PlayerPage = () => {
 
                             {sourceParam === "torrentio" && infoHash && (
                                 <DropdownMenu>
-                                    <DropdownMenuTrigger className="flex items-center gap-1 text-purple-400/80 text-[10px] uppercase tracking-widest hover:text-purple-300 transition-colors focus:outline-none animate-pulse">
+                                    <DropdownMenuTrigger className="flex items-center gap-1 text-[#E50914]/80 text-[10px] uppercase tracking-widest hover:text-[#E50914] transition-colors focus:outline-none animate-pulse">
                                         Mirror: {queryParams.get("mirror") || "webtor"}
                                         <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
                                     </DropdownMenuTrigger>
@@ -440,6 +457,8 @@ const PlayerPage = () => {
                     <VideoPlayer
                         isOffline
                         offlineSrc={offlineUrl}
+                        filePath={filePath}
+                        nextEpisodeKey={nextEpisodeKey}
                         title={title ?? ''}
                         containerRef={containerRef}
                         p2pLoading={p2pLoading}
@@ -532,6 +551,8 @@ const PlayerPage = () => {
                             containerRef={containerRef}
                             onIframeLoad={handleIframeLoad}
                             p2pLoading={p2pLoading}
+                            filePath={filePath}
+                            nextEpisodeKey={nextEpisodeKey}
                         />
 
                         {/* Invisible Trigger Zones for Iframe Mouse Events */}
